@@ -6,7 +6,7 @@ The stock VS Code extension hides every old session behind a cramped popover. Th
 
 Plus the layout and modal bugs that have been driving you up a wall.
 
-> Current release: **v0.4.0** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
+> Current release: **v0.4.1** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
 
 ---
 
@@ -30,9 +30,13 @@ Pass `--vsix-only` if you'd rather inspect the patched `.vsix` before installing
 
 A persistent session pane on the right of the chat, with a draggable divider. New header toggle hides it when you want the chat full-width — state and width persist across reloads.
 
-#### Pin / Star — actually toggleable
+#### Pin / Star / Archive
 
-Right-click any session. Pin floats it to the top of the list; Star prefixes it with ⭐. Both toggle on/off, and the menu labels flip to `Unpin` / `Unstar` so it's obvious what the next click does. Existing rename and delete still work exactly as they did.
+Right-click any session. Pin and Star are stored per session and toggle on/off cleanly. Archive removes sessions from the active flow without permanently deleting them; archived sessions sink to the bottom and expose the destructive delete action only when you actually mean it.
+
+#### Search and yolo controls
+
+The inline pane gets a lightweight search mode, and the header gets a yolo-mode toggle for bypassing permission prompts when you want Claude Code to keep moving.
 
 #### Filter sessions
 
@@ -97,7 +101,9 @@ The full feature spec sent to the Anthropic team lives in [CLAUDE_EXTENSION_FEED
 
 ## Changelog
 
-**v0.4.0** — Filter button in the header. Multi-select flyout: Type (Pinned / Starred / Running / Waiting) × Age (1h / 24h / 7d / 30d). Filters apply to both the inline session pane and the search popup. Active state persists in `localStorage`; the inline list subscribes to filter changes via a header-component effect so toggles re-render immediately. Helper-block freshness sentinel bumped (`ccPatchFilterSort`) so older patched installs auto-upgrade on re-run.
+**v0.4.1** — Hardens the dynamic Claude patcher for newer bundles, restores the release ergonomics that drifted during the rewrite (`--patcher-version`, `--vsix-only`, and auto-install), refreshes the README, and verifies against Claude Code 2.1.148.
+
+**v0.4.0** — Dynamic-anchor rewrite for newer Claude Code bundles, archive/unarchive flow, localStorage-backed pin/star state, yolo-mode header toggle, inline session search, filter flyout, Cursor-style left status indicators, improved relative time labels, and restored auto-install / `--patcher-version` release ergonomics.
 
 **v0.3.1** — Waiting indicator now reads `session.permissionRequests` (the array backing the popup itself) instead of `pendingInput`, which could latch true after a click and never clear. Priority reordered to `waiting → running → done` so the amber dot wins when a popup is open (otherwise the spinner stole the slot while Claude was paused mid-tool-use). Removed `ccPatchDebugState` dev helper that was leaking into release builds.
 

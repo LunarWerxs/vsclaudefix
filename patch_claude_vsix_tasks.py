@@ -1,9 +1,25 @@
 #!/usr/bin/env python
-"""VSCode Claude Code Extension Improvement's Patch.
+"""Post-build patcher for the Claude Code VS Code extension.
 
-Post-build patcher for the Claude Code VS Code extension. Adds a persistent
-right-side session pane, pin/star, status indicators (running / done / waiting),
-a header toggle, and modal/layout fixes. See README.md.
+Adds a persistent session pane and task controls to Claude Code. The patcher
+uses dynamic anchors so nearby Claude Code releases can be patched without
+hard-coding minified variable names.
+
+Features:
+  - Archive sessions: right-click or button replaces delete
+    * Non-archived sessions show an archive button (orange box icon)
+    * Archived sessions show a permanent delete button
+    * Right-click menu: Pin / Star / Archive (or Unarchive)
+  - Sort order: pinned first, then by time, archived sessions sink to bottom
+  - Status dot moved to LEFT of session name (Cursor-style)
+  - Improved time display: "2 days ago", "1 hr ago" etc.
+  - Yolo mode toggle button in header (bypass permissions)
+  - Inline resizable sessions panel with correct v2.1.147 variable names
+
+Usage:
+  python patch_claude_vsix_tasks.py
+  python patch_claude_vsix_tasks.py anthropic.claude-code-2.1.148.vsix
+  python patch_claude_vsix_tasks.py anthropic.claude-code-2.1.148.vsix --out my-patched.vsix
 """
 
 from __future__ import annotations
@@ -11,6 +27,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,11 +36,18 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
+
+# Pattern fragment for a minified JS identifier (e.g. `e`, `Nee`, `_Ye`).
+# The Claude webview is minified with single/short letter identifiers that
+# change every release. We anchor patches on stable strings (literal aria
+# labels, CSS class keys, property names like `summary.value`) and capture
+# the surrounding minified identifiers via regex named groups.
+JS_ID = r"[A-Za-z_$][\w$]*"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
 MARKETPLACE_QUERY_URL = (
-    "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
+    "https://marketplace.visualstudio.com/_apis/public/gallery/" "extensionquery?api-version=7.2-preview.1"
 )
 LOG_PATH: Path | None = None
 
@@ -33,8 +57,8 @@ def log(message: str) -> None:
     print(line, flush=True)
     if LOG_PATH is not None:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 def read(path: Path) -> str:
@@ -78,25 +102,35 @@ def download_marketplace_vsix(item: str, dest_dir: Path, version: str | None = N
     return dest
 
 
+# --------------------------------------------------------------------------- #
+# Helper JS — injected once at the session-list constant block                #
+# --------------------------------------------------------------------------- #
 CLAUDE_HELPER_JS = r"""function ccPatchTitle(e){return(e.summary?.value||`Untitled`).trim()}
-function ccPatchIsStarred(e){return ccPatchTitle(e).startsWith(`⭐ `)}
-function ccPatchIsPinned(e){let t=ccPatchTitle(e);return t.startsWith(`📌 `)||t.startsWith(`⭐ 📌 `)}
-function ccPatchToggleStarTitle(e){let t=ccPatchTitle(e);if(t.startsWith(`⭐ 📌 `))return`📌 ${t.slice(4).trimStart()}`;if(t.startsWith(`⭐ `))return t.slice(2).trimStart();if(t.startsWith(`📌 `))return`⭐ ${t}`;return`⭐ ${t}`}
-function ccPatchStarTitle(e){return ccPatchToggleStarTitle(e)}
-function ccPatchPinTitle(e){let t=ccPatchTitle(e),n=t.startsWith(`⭐ `),r=n?t.slice(2).trimStart():t;return r.startsWith(`📌 `)?(n?`⭐ `:``)+r.slice(2).trimStart():(n?`⭐ 📌 `:`📌 `)+r}
-function ccPatchSortSessions(e,t){return Number(ccPatchIsPinned(t))-Number(ccPatchIsPinned(e))||t.lastModifiedTime.value-e.lastModifiedTime.value}
+function ccPatchGetSS(e){try{let s=JSON.parse(localStorage.getItem(`ccPatchSS`)||`{}`);return s[ccPatchSessionId(e)]||{}}catch(err){return{}}}
+function ccPatchSetSS(e,p){try{let s=JSON.parse(localStorage.getItem(`ccPatchSS`)||`{}`),id=ccPatchSessionId(e);s[id]={...(s[id]||{}),...p};localStorage.setItem(`ccPatchSS`,JSON.stringify(s))}catch(err){}ccPatchFilterListeners.forEach(function(fn){try{fn()}catch(err){}})}
+function ccPatchIsArchived(e){return!!ccPatchGetSS(e).archived}
+function ccPatchIsPinned(e){return!!ccPatchGetSS(e).pinned}
+function ccPatchIsStarred(e){return!!ccPatchGetSS(e).starred}
+function ccPatchToggleArchive(e){let c=ccPatchGetSS(e);ccPatchSetSS(e,c.archived?{archived:false}:{archived:true,pinned:false,starred:false})}
+function ccPatchTogglePin(e){ccPatchSetSS(e,{pinned:!ccPatchIsPinned(e)})}
+function ccPatchToggleStar(e){ccPatchSetSS(e,{starred:!ccPatchIsStarred(e)})}
+function ccPatchSortSessions(e,t){let ae=ccPatchIsArchived(e),at=ccPatchIsArchived(t);if(ae!==at)return ae?1:-1;if(!ae){let se=ccPatchIsStarred(e),st=ccPatchIsStarred(t);if(se!==st)return se?-1:1;let pe=ccPatchIsPinned(e),pt=ccPatchIsPinned(t);if(pe!==pt)return pe?-1:1}return t.lastModifiedTime.value-e.lastModifiedTime.value}
 function ccPatchSessionId(e){return e.sessionId?.value||e.internalId||ccPatchTitle(e)}
 var ccPatchBusyBySession=new Map,ccPatchDoneSessions=new Set;
 function ccPatchTrackSessionStatus(e,t){let n=ccPatchSessionId(e),r=!!e.busy?.value,a=ccPatchBusyBySession.get(n);a===void 0?ccPatchBusyBySession.set(n,r):(a&&!r&&(ccPatchDoneSessions.add(n),setTimeout(t,0)),ccPatchBusyBySession.set(n,r))}
 function ccPatchClearDone(e){ccPatchDoneSessions.delete(ccPatchSessionId(e))}
 function ccPatchIsWaiting(e){let t=e.permissionRequests?.value;return!!(t&&t.length>0)}
 function ccPatchSessionIndicator(e,t){if(!t&&ccPatchIsWaiting(e))return`waiting`;if(e.busy?.value)return`running`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
+function ccPatchActivityText(e){if(e.permissionRequests?.value?.length)return`Waiting for input`;if(!e.busy?.value)return null;let m=e.messages?.value;if(m&&m.length>0){let l=m[m.length-1];if(l){let c=l.content;if(Array.isArray(c)){for(let j=c.length-1;j>=0;j--){let b=c[j];if(!b)continue;if(b.type===`tool_use`){let n=b.name||``,inp=b.input;if(inp&&inp.command)return`Running `+String(inp.command).replace(/\s+/g,` `).slice(0,50);if(inp&&inp.file_path)return(n===`Read`?`Reading `:`Editing `)+String(inp.file_path).split(/[/\\]/).pop();return`Running `+n.replace(/_/g,` `)+`...`}if(b.type===`thinking`)return`Thinking...`;if(b.type===`text`&&b.text)return String(b.text).replace(/\s+/g,` `).slice(0,50).trim()}}}}return`Thinking...`}
 function ccPatchCloseMenu(){document.querySelector(`.claudePatchContextMenu`)?.remove()}
-function ccPatchShowMenu(e,t,n,r,a,i){ccPatchCloseMenu();let s=document.createElement(`div`);s.className=`claudePatchContextMenu`,s.style.left=`${Math.min(e,window.innerWidth-150)}px`,s.style.top=`${Math.min(t,window.innerHeight-72)}px`;let o=(c,l)=>{let d=document.createElement(`button`),u=!1,h=(p)=>{p.preventDefault(),p.stopPropagation();if(u)return;u=!0,ccPatchCloseMenu(),l()};return d.textContent=c,d.onmousedown=h,d.onclick=h,s.appendChild(d),d};o(a||`Pin`,n),o(i||`Star`,r),document.body.appendChild(s);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
-function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t||document.body.classList.contains(`claudePatchSessionsHidden`))return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`);try{localStorage.setItem(`claudePatchSessionsWidth`,String(s))}catch(o){}},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
-function ccPatchAreSessionsHidden(){try{return localStorage.getItem(`claudePatchSessionsHidden`)===`1`}catch(e){return!1}}
-function ccPatchApplyVisibility(){let e=ccPatchAreSessionsHidden();document.body.classList.toggle(`claudePatchSessionsHidden`,e);try{let t=parseFloat(localStorage.getItem(`claudePatchSessionsWidth`)||``);if(t>=180&&t<=window.innerWidth*.75)document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${t}px`)}catch(n){}}
-function ccPatchToggleSessions(){let e=!ccPatchAreSessionsHidden();try{localStorage.setItem(`claudePatchSessionsHidden`,e?`1`:`0`)}catch(t){}document.body.classList.toggle(`claudePatchSessionsHidden`,e)}
+function ccPatchShowMenu(e,t,pLabel,n,sLabel,r,a){ccPatchCloseMenu();let i=document.createElement(`div`);i.className=`claudePatchContextMenu`,i.style.left=`${Math.min(e,window.innerWidth-150)}px`,i.style.top=`${Math.min(t,window.innerHeight-96)}px`;let s=(o,c)=>{let u=document.createElement(`button`),f=!1,d=(v)=>{v.preventDefault(),v.stopPropagation();if(f)return;f=!0,ccPatchCloseMenu(),c()};return u.textContent=o,u.onmousedown=d,u.onclick=d,i.appendChild(u),u};s(pLabel,n);s(sLabel,r);if(a)s(a.label,a.fn);document.body.appendChild(i);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
+var ccPatchPaneVis=(function(){try{return localStorage.getItem(`ccPatchPaneVis`)!==`false`}catch(e){return true}})();
+function ccPatchTogglePane(){ccPatchPaneVis=!ccPatchPaneVis;try{localStorage.setItem(`ccPatchPaneVis`,String(ccPatchPaneVis))}catch(e){}document.documentElement.classList.toggle(`ccPatchPaneHidden`,!ccPatchPaneVis)}
+if(!ccPatchPaneVis)document.documentElement.classList.add(`ccPatchPaneHidden`);
+var ccPatchSearchQ=``;
+function ccPatchSetSearch(q){ccPatchSearchQ=q;ccPatchFilterListeners.forEach(function(fn){try{fn()}catch(err){}})}
+function ccPatchToggleSearch(){let p=document.querySelector(`.claudePatchInlineSessions`),i=document.querySelector(`.ccPatchSearchInput`);if(!p||!i)return;let v=p.classList.toggle(`ccPatchSearchActive`);if(v){setTimeout(function(){i.focus();i.select()},0)}else{ccPatchSetSearch(``);i.value=``}}
+function ccPatchStartResize(e){e.preventDefault();if(!ccPatchPaneVis)return;let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t)return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`)},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
 var ccPatchFilterListeners=new Set;
 function ccPatchAgeMsMap(){return{"1h":36e5,"24h":864e5,"7d":6048e5,"30d":2592e6}}
 function ccPatchDefaultFilters(){return{types:[],ages:[]}}
@@ -104,228 +138,1435 @@ function ccPatchReadFilters(){try{let e=JSON.parse(localStorage.getItem(`claudeP
 function ccPatchWriteFilters(e){try{localStorage.setItem(`claudePatchFilters`,JSON.stringify(e))}catch(t){}ccPatchFilterListeners.forEach((n)=>{try{n()}catch(r){}})}
 function ccPatchFiltersActive(){let e=ccPatchReadFilters();return e.types.length+e.ages.length}
 function ccPatchSessionMatchesFilters(e,t){if(!t)t=ccPatchReadFilters();if(t.types.length){let n=!1;for(let r of t.types){if(r===`pinned`&&ccPatchIsPinned(e))n=!0;else if(r===`starred`&&ccPatchIsStarred(e))n=!0;else if(r===`running`&&e.busy?.value)n=!0;else if(r===`waiting`&&ccPatchIsWaiting(e))n=!0;if(n)break}if(!n)return!1}if(t.ages.length){let n=ccPatchAgeMsMap(),r=0;for(let a of t.ages){let i=n[a]||0;if(i>r)r=i}if(r>0){let a=e.lastModifiedTime?.value;if(typeof a!==`number`||Date.now()-a>r)return!1}}return!0}
-function ccPatchFilterSort(e){let t=ccPatchReadFilters(),n=t.types.length||t.ages.length?e.filter((r)=>ccPatchSessionMatchesFilters(r,t)):[...e];return n.sort(ccPatchSortSessions)}
-function ccPatchCloseFilterMenu(){document.querySelector(`.claudePatchFilterMenu`)?.remove();document.querySelector(`.claudePatchFilterButton.claudePatchFilterButtonOpen`)?.classList.remove(`claudePatchFilterButtonOpen`)}
-function ccPatchShowFilterMenu(e){ccPatchCloseFilterMenu();let t=e.currentTarget;if(!t)return;t.classList.add(`claudePatchFilterButtonOpen`);let n=t.getBoundingClientRect(),r=document.createElement(`div`);r.className=`claudePatchFilterMenu`,r.style.top=`${Math.round(n.bottom+4)}px`;let a=Math.round(n.left);r.style.left=`${Math.min(a,window.innerWidth-260)}px`;let i=ccPatchReadFilters(),s=(g,b)=>{let m=document.createElement(`div`);m.className=`claudePatchFilterGroup`;let f=document.createElement(`div`);f.className=`claudePatchFilterGroupTitle`,f.textContent=g,m.appendChild(f);for(let[v,w]of b){let y=document.createElement(`label`);y.className=`claudePatchFilterOption`;let k=document.createElement(`input`);k.type=`checkbox`;let A=g===`Type`?`types`:`ages`;k.checked=i[A].includes(v),k.onchange=()=>{let z=ccPatchReadFilters();if(k.checked){if(!z[A].includes(v))z[A].push(v)}else z[A]=z[A].filter((q)=>q!==v);ccPatchWriteFilters(z),i=z};let _=document.createElement(`span`);_.textContent=w,y.appendChild(k),y.appendChild(_),m.appendChild(y)}r.appendChild(m)};s(`Type`,[[`pinned`,`📌 Pinned`],[`starred`,`⭐ Starred`],[`running`,`Running`],[`waiting`,`Waiting`]]),s(`Age`,[[`1h`,`Last 1 hour`],[`24h`,`Last 24 hours`],[`7d`,`Last 7 days`],[`30d`,`Last 30 days`]]);let o=document.createElement(`div`);o.className=`claudePatchFilterFooter`;let c=document.createElement(`button`);c.textContent=`Clear all`,c.onclick=(g)=>{g.preventDefault(),g.stopPropagation(),ccPatchWriteFilters(ccPatchDefaultFilters()),ccPatchCloseFilterMenu()},o.appendChild(c),r.appendChild(o),document.body.appendChild(r);let l=(g)=>{if(!r.contains(g.target)&&!t.contains(g.target))ccPatchCloseFilterMenu(),document.removeEventListener(`mousedown`,l,!0)};setTimeout(()=>document.addEventListener(`mousedown`,l,!0),0)}
-if(typeof document!==`undefined`){if(document.readyState===`loading`)document.addEventListener(`DOMContentLoaded`,ccPatchApplyVisibility);else ccPatchApplyVisibility()}
+function ccPatchFilterSort(e){let t=ccPatchReadFilters(),q=ccPatchSearchQ.trim().toLowerCase(),n=t.types.length||t.ages.length?e.filter((r)=>ccPatchSessionMatchesFilters(r,t)):[...e];if(q)n=n.filter((r)=>ccPatchTitle(r).toLowerCase().includes(q));return n.sort(ccPatchSortSessions)}
+function ccPatchCloseFilterMenu(){document.querySelector(`.claudePatchFilterMenu`)?.remove();document.querySelector(`.ccPatchFilterButton.ccPatchFilterButtonOpen`)?.classList.remove(`ccPatchFilterButtonOpen`)}
+function ccPatchShowFilterMenu(e){ccPatchCloseFilterMenu();let t=e.currentTarget;if(!t)return;t.classList.add(`ccPatchFilterButtonOpen`);let n=t.getBoundingClientRect(),r=document.createElement(`div`);r.className=`claudePatchFilterMenu`,r.style.top=`${Math.round(n.bottom+4)}px`,r.style.left=`${Math.min(Math.round(n.left),window.innerWidth-260)}px`;let i=ccPatchReadFilters(),s=(g,b)=>{let m=document.createElement(`div`);m.className=`claudePatchFilterGroup`;let f=document.createElement(`div`);f.className=`claudePatchFilterGroupTitle`,f.textContent=g,m.appendChild(f);for(let[v,w]of b){let y=document.createElement(`label`);y.className=`claudePatchFilterOption`;let k=document.createElement(`input`);k.type=`checkbox`;let A=g===`Type`?`types`:`ages`;k.checked=i[A].includes(v),k.onchange=()=>{let z=ccPatchReadFilters();if(k.checked){if(!z[A].includes(v))z[A].push(v)}else z[A]=z[A].filter((q)=>q!==v);ccPatchWriteFilters(z),i=z};let _=document.createElement(`span`);_.textContent=w,y.appendChild(k),y.appendChild(_),m.appendChild(y)}r.appendChild(m)};s(`Type`,[[`pinned`,`📌 Pinned`],[`starred`,`⭐ Starred`],[`running`,`Running`],[`waiting`,`Waiting`]]);s(`Age`,[[`1h`,`Last 1 hour`],[`24h`,`Last 24 hours`],[`7d`,`Last 7 days`],[`30d`,`Last 30 days`]]);let o=document.createElement(`div`);o.className=`claudePatchFilterFooter`;let c=document.createElement(`button`);c.textContent=`Clear all`,c.onclick=(g)=>{g.preventDefault(),g.stopPropagation(),ccPatchWriteFilters(ccPatchDefaultFilters()),ccPatchCloseFilterMenu()},o.appendChild(c),r.appendChild(o),document.body.appendChild(r);setTimeout(()=>document.addEventListener(`mousedown`,(g)=>{if(!r.contains(g.target)&&!t.contains(g.target))ccPatchCloseFilterMenu()},{once:!0}),0)}
 """
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Anchor capture
+#
+# Claude's webview/index.js is minified — identifiers like `S0`, `w2`, `OR0`,
+# `Rs`, `fe1`, `h6`, `p0`, `NR0`, `Kk`, `Le1`, `Ne1`, `sa`, `QQ`, `in1`,
+# `nn1`, `gn1` change every release. Rather than hard-coding them, we capture
+# them at runtime via regex on stable strings (literal aria-labels, CSS class
+# keys like `sessionItem`, property accesses like `.summary.value`,
+# `.lastModifiedTime.value`, etc.).
+#
+# The whole feature graph clusters into three components in the bundle:
+#   • Rs            — outer "sessions" list (contains the b.filter sort and
+#                     the sessionsList map block).
+#   • OR0           — inner session-row forwardRef (contains the rename/delete
+#                     button, the worktree pill, the time formatter call).
+#   • fe1           — top-level chat-tab container (contains h6.body/content
+#                     and the toolbar with the history toggle button).
+# We capture one regex per component and look up every minified identifier
+# we need from the captured groups.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _capture_rs_component(text: str) -> dict[str, str]:
+    """Capture the outer sessions-list component (`function Rs(...)`).
+
+    Returns a dict mapping logical-name → captured minified identifier:
+      {fn, S0, w2, _R0, wR0, localSessions, localSessionsLoaded,
+       remoteSessions, remoteConnected, remoteReconnecting,
+       remoteSessionsLoaded, onReconnectRemote, activeSession,
+       onSessionClick, onRenameSession, onDeleteSession, onOpenInNewWindow,
+       currentCwd, authMethod, onRefresh, autoFocusSearch, isSessionListOnly,
+       onOpenURL, b, _1, F, t, K1, H1, s, p, o, $1, w, O, N, E, y, _, U, V,
+       H, B, q, z}
+    """
+    # 1. The `var w2={root:"...",sessionItem:"...",...};var _R0=N,wR0=N;`
+    #    declaration just before `function Rs`. Anchor on the timing const
+    #    pair (16/1000 — used to drive a spinner at 60fps over 1s) and walk
+    #    back to grab the class-name object whose declaration ends right
+    #    before it. Key names can appear in any order so we don't try to
+    #    match them inside the object literal.
+    m_timing = re.search(
+        rf"\}};var\s+(?P<R0>{JS_ID})=16,(?P<R1>{JS_ID})=1000;",
+        text,
+    )
+    if m_timing is None:
+        raise RuntimeError("Could not find timing-constant pair (var _R0=16,wR0=1000)")
+    # Walk back to find the matching `var <w2>={` whose closing `}` precedes
+    # the `;var <R0>=16,<R1>=1000;` we just found. Scan braces inside strings
+    # safely by skipping `"..."` and `'...'` literals.
+    depth = 1
+    i = m_timing.start() - 1  # last `}` of the object
+    while i >= 0 and depth > 0:
+        c = text[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            depth -= 1
+            if depth == 0:
+                break
+        i -= 1
+    if depth != 0 or i < 0:
+        raise RuntimeError("Could not bracket the class-name object before the timing constants")
+    # i is now at the `{` of the object. The `var <id>=` precedes it.
+    m_w2 = re.search(
+        rf"var\s+(?P<w2>{JS_ID})=$",
+        text[max(0, i - 40) : i],
+    )
+    if m_w2 is None:
+        raise RuntimeError("Could not find sessions-list class-name object + timing const declaration")
+
+    # 2. The `function Rs({localSessions:$, ..., onOpenURL:A})` signature.
+    #    Anchored on the prop-name order, which is part of the source TS
+    #    interface (rename-safe across releases).
+    m_rs = re.search(
+        rf"function\s+(?P<fn>{JS_ID})\(\{{"
+        rf"localSessions:(?P<localSessions>{JS_ID}),"
+        rf"localSessionsLoaded:(?P<localSessionsLoaded>{JS_ID}),"
+        rf"remoteSessions:(?P<remoteSessions>{JS_ID}),"
+        rf"remoteConnected:(?P<remoteConnected>{JS_ID}),"
+        rf"remoteReconnecting:(?P<remoteReconnecting>{JS_ID}),"
+        rf"remoteSessionsLoaded:(?P<remoteSessionsLoaded>{JS_ID}),"
+        rf"onReconnectRemote:(?P<onReconnectRemote>{JS_ID}),"
+        rf"activeSession:(?P<activeSession>{JS_ID}),"
+        rf"onSessionClick:(?P<onSessionClick>{JS_ID}),"
+        rf"onRenameSession:(?P<onRenameSession>{JS_ID}),"
+        rf"onDeleteSession:(?P<onDeleteSession>{JS_ID}),"
+        rf"onOpenInNewWindow:(?P<onOpenInNewWindow>{JS_ID}),"
+        rf"currentCwd:(?P<currentCwd>{JS_ID}),"
+        rf"authMethod:(?P<authMethod>{JS_ID}),"
+        rf"onRefresh:(?P<onRefresh>{JS_ID}),"
+        rf"autoFocusSearch:(?P<autoFocusSearch>{JS_ID}),"
+        rf"isSessionListOnly:(?P<isSessionListOnly>{JS_ID}),"
+        rf"onOpenURL:(?P<onOpenURL>{JS_ID})"
+        rf"\}}\)\{{",
+        text,
+    )
+    if m_rs is None:
+        raise RuntimeError("Could not find Rs sessions-list component signature")
+
+    # 3. The Rs body locals up through `t=S0.useRef(F);`.
+    body_start = m_rs.end()
+    # Match the full prelude:
+    #   z6();let P=W==="claudeai",[_,M]=S0.useState("local"),[w,O]=S0.useState(0),
+    #   [N,E]=S0.useState(null),[y,x]=S0.useState(""),[p,o]=S0.useState(null),
+    #   $1=S0.useRef(new Map),u=S0.useRef(null),
+    #   s=S0.useCallback(...),K1=S0.useCallback(...),H1=S0.useCallback(...),
+    #   _1=_==="local"?$:J,
+    #   b=y?_1.filter(...):_1,
+    #   t=S0.useRef(F);
+    m_body = re.search(
+        rf"(?P<init>{JS_ID})\(\);"
+        rf"let\s+(?P<P>{JS_ID})=(?P<authMethod2>{JS_ID})===\"claudeai\","
+        rf"\[(?P<tab>{JS_ID}),(?P<setTab>{JS_ID})\]=(?P<S0>{JS_ID})\.useState\(\"local\"\),"
+        rf"\[(?P<w>{JS_ID}),(?P<O>{JS_ID})\]=(?P=S0)\.useState\(0\),"
+        rf"\[(?P<N>{JS_ID}),(?P<E>{JS_ID})\]=(?P=S0)\.useState\(null\),"
+        rf"\[(?P<y>{JS_ID}),(?P<x>{JS_ID})\]=(?P=S0)\.useState\(\"\"\),"
+        rf"\[(?P<p>{JS_ID}),(?P<o>{JS_ID})\]=(?P=S0)\.useState\(null\),"
+        rf"(?P<refMap>{JS_ID})=(?P=S0)\.useRef\(new Map\),"
+        rf"(?P<inputRef>{JS_ID})=(?P=S0)\.useRef\(null\),"
+        rf"(?P<s>{JS_ID})=(?P=S0)\.useCallback\(",
+        text[body_start : body_start + 2000],
+    )
+    if m_body is None:
+        raise RuntimeError("Could not parse Rs component body prelude")
+
+    # 4. Capture K1, H1, _1, b, F, t from the rest of the prelude. After
+    #    the `s=useCallback(...)` we have `K1=useCallback(...),H1=useCallback(...)`
+    #    then `_1=<tab>==="local"?<localSessions>:<remoteSessions>,`
+    #    then `b=<y>?<_1>.filter(...):<_1>,t=useRef(<F>);`. We anchor on the
+    #    stable parts.
+    s_var = m_body.group("s")
+    S0 = m_body.group("S0")
+    y_var = m_body.group("y")
+    tab_var = m_body.group("tab")
+    localSessions = m_rs.group("localSessions")
+    remoteSessions = m_rs.group("remoteSessions")
+    # Search forward from just past the `s=useCallback(` opening we already
+    # matched. The first thing past that opening is the s-callback body
+    # (a lambda or arrow function); after it closes we hit `,K1=useCallback(`.
+    rest_start = body_start + m_body.end()
+    m_rest = re.search(
+        rf",(?P<K1>{JS_ID})={re.escape(S0)}\.useCallback\("
+        rf".*?,(?P<H1>{JS_ID})={re.escape(S0)}\.useCallback\("
+        rf".*?,(?P<_1>{JS_ID})={re.escape(tab_var)}===\"local\"\?"
+        rf"{re.escape(localSessions)}:{re.escape(remoteSessions)},"
+        rf"(?P<b>{JS_ID})={re.escape(y_var)}\?(?P=_1)\.filter\(",
+        text[rest_start : rest_start + 4000],
+        re.DOTALL,
+    )
+    if m_rest is None:
+        raise RuntimeError("Could not parse Rs callbacks / b / _1 locals")
+
+    # 5. The sort anchor itself: `}):<_1>,<t>=<S0>.useRef(<F>);`. This locks
+    #    in the `F`, `t` identifiers and gives us a single point to splice
+    #    block 2 against.
+    _1 = m_rest.group("_1")
+    m_sort = re.search(
+        rf"\}}\):{re.escape(_1)},(?P<t>{JS_ID})={re.escape(S0)}\.useRef\((?P<F>{JS_ID})\);",
+        text[body_start : body_start + 6000],
+    )
+    if m_sort is None:
+        raise RuntimeError("Could not find Rs sort anchor `}):<_1>,t=S0.useRef(F);`")
+
+    return {
+        "fn": m_rs.group("fn"),
+        "w2": m_w2.group("w2"),
+        "_R0": m_timing.group("R0"),
+        "wR0": m_timing.group("R1"),
+        "S0": S0,
+        "init": m_body.group("init"),
+        "tab": tab_var,
+        "w": m_body.group("w"),
+        "O": m_body.group("O"),
+        "N": m_body.group("N"),
+        "E": m_body.group("E"),
+        "y": y_var,
+        "p": m_body.group("p"),
+        "o": m_body.group("o"),
+        "$1": m_body.group("refMap"),
+        "s": s_var,
+        "K1": m_rest.group("K1"),
+        "H1": m_rest.group("H1"),
+        "_1": _1,
+        "b": m_rest.group("b"),
+        "t": m_sort.group("t"),
+        "F": m_sort.group("F"),
+        # Rs props
+        "localSessions": localSessions,
+        "localSessionsLoaded": m_rs.group("localSessionsLoaded"),
+        "remoteSessions": remoteSessions,
+        "remoteConnected": m_rs.group("remoteConnected"),
+        "remoteReconnecting": m_rs.group("remoteReconnecting"),
+        "remoteSessionsLoaded": m_rs.group("remoteSessionsLoaded"),
+        "onReconnectRemote": m_rs.group("onReconnectRemote"),
+        "activeSession": m_rs.group("activeSession"),
+        "onSessionClick": m_rs.group("onSessionClick"),
+        "onRenameSession": m_rs.group("onRenameSession"),
+        "onDeleteSession": m_rs.group("onDeleteSession"),
+        "onOpenInNewWindow": m_rs.group("onOpenInNewWindow"),
+        "currentCwd": m_rs.group("currentCwd"),
+        "authMethod": m_rs.group("authMethod"),
+        "onRefresh": m_rs.group("onRefresh"),
+        "autoFocusSearch": m_rs.group("autoFocusSearch"),
+        "isSessionListOnly": m_rs.group("isSessionListOnly"),
+        "onOpenURL": m_rs.group("onOpenURL"),
+        # Indices into the text for splicing block 2 (sort)
+        "sort_anchor_start": body_start + m_sort.start(),
+        "sort_anchor_end": body_start + m_sort.end(),
+    }
+
+
+def _capture_or0_component(text: str, S0: str, w2: str) -> dict[str, str]:
+    """Capture the inner session-row forwardRef (`OR0`).
+
+    Returns a dict with the row component identifier and every destructured
+    param the patch references inside the row body.
+    """
+    # `var OR0=S0.default.forwardRef(function({session:Z,isActive:J,...},F){`
+    m = re.search(
+        rf"var\s+(?P<OR0>{JS_ID})={re.escape(S0)}\.default\.forwardRef\(function\(\{{"
+        rf"session:(?P<session>{JS_ID}),"
+        rf"isActive:(?P<isActive>{JS_ID}),"
+        rf"isFocused:(?P<isFocused>{JS_ID}),"
+        rf"isRenaming:(?P<isRenaming>{JS_ID}),"
+        rf"searchQuery:(?P<searchQuery>{JS_ID}),"
+        rf"onClick:(?P<onClick>{JS_ID}),"
+        rf"onMouseMove:(?P<onMouseMove>{JS_ID}),"
+        rf"onStartRename:(?P<onStartRename>{JS_ID}),"
+        rf"onFinishRename:(?P<onFinishRename>{JS_ID}),"
+        rf"onCancelRename:(?P<onCancelRename>{JS_ID}),"
+        rf"onDelete:(?P<onDelete>{JS_ID}),"
+        rf"onOpenInNewWindow:(?P<onOpenInNewWindow>{JS_ID}),"
+        rf"currentCwd:(?P<currentCwd>{JS_ID})"
+        rf"\}},(?P<F>{JS_ID})\)\{{",
+        text,
+    )
+    if m is None:
+        raise RuntimeError("Could not find OR0 forwardRef destructure")
+
+    body_start = m.end()
+    body_end = min(len(text), body_start + 8000)
+    body = text[body_start:body_end]
+
+    # Status hook prelude: `<init>();let <j>=<S0>.useRef(null),<D>=<S0>.useRef(!0);`
+    m_hook = re.search(
+        rf"(?P<init>{JS_ID})\(\);"
+        rf"let\s+(?P<j>{JS_ID})={re.escape(S0)}\.useRef\(null\),"
+        rf"(?P<D>{JS_ID})={re.escape(S0)}\.useRef\(!0\);",
+        body,
+    )
+    if m_hook is None:
+        raise RuntimeError("Could not find OR0 status-hook prelude")
+
+    # Locals used in the rename text-input: `onKeyDown:A,onBlur:P`.
+    m_kb = re.search(
+        rf"contentEditable:!0,suppressContentEditableWarning:!0," rf"onKeyDown:(?P<A>{JS_ID}),onBlur:(?P<P>{JS_ID}),",
+        body,
+    )
+    if m_kb is None:
+        raise RuntimeError("Could not find OR0 rename-input keydown/blur params")
+
+    # Title fn (`Kk`) and search-highlight fn (`Le1`) from
+    # `},Kk(Z)):S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q))`
+    session = m.group("session")
+    isRenaming = m.group("isRenaming")
+    searchQuery = m.group("searchQuery")
+    m_titlefn = re.search(
+        rf"\}},(?P<Kk>{JS_ID})\({re.escape(session)}\)\):"
+        rf"{re.escape(S0)}\.default\.createElement\(\"span\","
+        rf"\{{className:{re.escape(w2)}\.sessionName\}},"
+        rf"(?P<Le1>{JS_ID})\((?P=Kk)\({re.escape(session)}\),{re.escape(searchQuery)}\)\),",
+        body,
+    )
+    if m_titlefn is None:
+        raise RuntimeError("Could not find OR0 title/highlight fn names")
+
+    # Rename and delete icon components from the action buttons.
+    # `title:"Rename session"},S0.default.createElement(<sa>,{className:w2.actionIcon}))`
+    m_renameicon = re.search(
+        rf'title:"Rename session"\}},{re.escape(S0)}\.default\.createElement\((?P<sa>{JS_ID}),'
+        rf"\{{className:{re.escape(w2)}\.actionIcon\}}\)\)",
+        body,
+    )
+    m_delicon = re.search(
+        rf'title:"Delete session"\}},{re.escape(S0)}\.default\.createElement\((?P<Ne1>{JS_ID}),'
+        rf"\{{className:{re.escape(w2)}\.actionIcon\}}\)",
+        body,
+    )
+    if m_renameicon is None or m_delicon is None:
+        raise RuntimeError("Could not find OR0 rename/delete icon component refs")
+
+    # Status-var anchor `let _=<isActive>&&!<session>.summary.value&&...;return`
+    isActive = m.group("isActive")
+    m_status_var = re.search(
+        rf"let\s+(?P<underscore>{JS_ID})={re.escape(isActive)}"
+        rf"&&!{re.escape(session)}\.summary\.value"
+        rf"&&!{re.escape(session)}\.messages\.value\.length"
+        rf"&&!{re.escape(session)}\.teleportedMessageCount\.value;return",
+        body,
+    )
+    if m_status_var is None:
+        raise RuntimeError("Could not find OR0 status-var anchor")
+
+    return {
+        "OR0": m.group("OR0"),
+        "Z": session,
+        "J": m.group("isActive"),
+        "Y": m.group("isFocused"),
+        "X": isRenaming,
+        "Q": searchQuery,
+        "G": m.group("onClick"),
+        "q": m.group("onMouseMove"),
+        "z": m.group("onStartRename"),
+        "U": m.group("onFinishRename"),
+        "V": m.group("onCancelRename"),
+        "H": m.group("onDelete"),
+        "B": m.group("onOpenInNewWindow"),
+        "W": m.group("currentCwd"),
+        "F": m.group("F"),
+        "j": m_hook.group("j"),
+        "D": m_hook.group("D"),
+        "A": m_kb.group("A"),
+        "P": m_kb.group("P"),
+        "Kk": m_titlefn.group("Kk"),
+        "Le1": m_titlefn.group("Le1"),
+        "sa": m_renameicon.group("sa"),
+        "Ne1": m_delicon.group("Ne1"),
+        "underscore": m_status_var.group("underscore"),
+        "body_start": body_start,
+    }
+
+
+def _capture_nr0(text: str) -> str:
+    r"""Capture the minified name of the time-format function `NR0`.
+
+    The bundle ships `function NR0($){let J=Date.now()-$,Y=Math.floor(J/1000),
+    X=Math.floor(Y/60),Q=Math.floor(X/60),G=Math.floor(Q/24),q=Math.floor(G/30),
+    z=Math.floor(G/365);if(z>0)return\`${z}y\`;...}`. The function name is
+    minified but the body structure is stable. We allow the local var letters
+    inside the body to differ because the minifier can vary them.
+    """
+    m = re.search(
+        rf"function\s+(?P<NR0>{JS_ID})\((?P<p>{JS_ID})\)\{{"
+        rf"let\s+(?P<J>{JS_ID})=Date\.now\(\)-(?P=p),"
+        rf"(?P<Y>{JS_ID})=Math\.floor\((?P=J)/1000\),"
+        rf"(?P<X>{JS_ID})=Math\.floor\((?P=Y)/60\),"
+        rf"(?P<Q>{JS_ID})=Math\.floor\((?P=X)/60\),"
+        rf"(?P<G>{JS_ID})=Math\.floor\((?P=Q)/24\),"
+        rf"(?P<q>{JS_ID})=Math\.floor\((?P=G)/30\),"
+        rf"(?P<z>{JS_ID})=Math\.floor\((?P=G)/365\);"
+        rf"if\((?P=z)>0\)return`\$\{{(?P=z)\}}y`;",
+        text,
+    )
+    if m is None:
+        raise RuntimeError("Could not find NR0 time-format function")
+    return m.group("NR0")
+
+
+def _capture_fe1_component(text: str) -> dict[str, str | int]:
+    """Capture the top-level chat-tab container (`fe1`) and its key locals.
+
+    Returns identifiers for:
+      • p0           — React alias used by fe1
+      • h6           — class-name object alias used by fe1
+      • $, Z         — the {sessions:$,context:Z} destructure
+      • QQ           — the toolbar IconButton component
+      • in1          — the Session-history icon component
+      • G, q         — `let[G,q]=p0.useState(!1)` toggling the history sheet
+      • X            — `X=p0.useRef(null)` used as ref:X on the history button
+      • Re1          — the existing recent-sessions panel component invoked
+                       further down (we reuse its props to drive our inline Rs)
+      • re1_call_start/end — offsets of the existing `Re1` createElement call
+      • gn1, an1     — milestone helpers used in block 13 filter hook
+      • body_anchor  — text offset of `createElement("div",{className:h6.body},`
+    """
+    # h6 declaration: a class-name object that contains all of `body`,
+    # `content`, and `sessionBody` keys (in any order). We scan candidate
+    # `var <id>={...};` declarations and pick the first one whose body
+    # contains all three keys.
+    h6 = None
+    for m in re.finditer(rf"\bvar\s+(?P<id>{JS_ID})=\{{", text):
+        i = m.end() - 1  # at the `{`
+        depth = 0
+        end_idx = -1
+        k = i
+        while k < len(text):
+            c = text[k]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end_idx = k + 1
+                    break
+            k += 1
+        if end_idx < 0:
+            continue
+        body = text[i:end_idx]
+        if 'sessionBody:"' in body and 'body:"' in body and 'content:"' in body and 'teleportErrorBanner:"' in body:
+            h6 = m.group("id")
+            break
+    if h6 is None:
+        raise RuntimeError("Could not find h6 class-name object declaration")
+
+    # fe1 signature: `function fe1({sessions:$,context:Z}){...let[G,q]=p0.useState(!1)...}`
+    m_fe1 = re.search(
+        rf"function\s+(?P<fn>{JS_ID})\(\{{sessions:(?P<S>{JS_ID}),context:(?P<C>{JS_ID})\}}\)\{{"
+        rf"(?P<init>{JS_ID})\(\);"
+        rf"let\s+(?P<refJ>{JS_ID})=(?P<p0>{JS_ID})\.useRef\(null\),"
+        rf"(?P<refY>{JS_ID})=(?P=p0)\.useRef\(null\),"
+        rf"(?P<refX>{JS_ID})=(?P=p0)\.useRef\(null\),"
+        rf"(?P<refQ>{JS_ID})=(?P=p0)\.useRef\(null\),"
+        rf"\[(?P<G>{JS_ID}),(?P<setG>{JS_ID})\]=(?P=p0)\.useState\(!1\),",
+        text,
+    )
+    if m_fe1 is None:
+        raise RuntimeError("Could not find fe1 chat-tab container signature")
+
+    p0 = m_fe1.group("p0")
+    fe1_start = m_fe1.start()
+    fe1_end = min(len(text), m_fe1.end() + 14000)
+    body = text[fe1_start:fe1_end]
+
+    # The history toggle button:
+    # `p0.default.createElement(QQ,{ref:X,ariaLabel:"Session history",iconSize:20,onClick:()=>q(!G)},p0.default.createElement(in1,null))`
+    m_hist = re.search(
+        rf"{re.escape(p0)}\.default\.createElement\((?P<QQ>{JS_ID}),"
+        rf"\{{ref:(?P<refUsed>{JS_ID}),ariaLabel:\"Session history\",iconSize:20,"
+        rf"onClick:\(\)=>(?P<setterUsed>{JS_ID})\(!(?P<stateUsed>{JS_ID})\)\}},"
+        rf"{re.escape(p0)}\.default\.createElement\((?P<in1>{JS_ID}),null\)\)",
+        body,
+    )
+    if m_hist is None:
+        raise RuntimeError("Could not find session-history toggle createElement")
+
+    # The body/content anchor in fe1.
+    body_anchor_rel = body.find(f'createElement("div",{{className:{h6}.body}},')
+    if body_anchor_rel < 0:
+        raise RuntimeError("Could not find h6.body anchor inside fe1")
+    body_anchor = fe1_start + body_anchor_rel
+
+    # The existing Re1 recent-sessions invocation, which we mirror for our
+    # inline Rs invocation in block 12.
+    # `p0.default.createElement(Re1,{isOpen:G,onClose:()=>q(!1),onOpen:...,localSessions:[...$.sessions.value].sort(...),...})`
+    m_re1 = re.search(
+        rf"{re.escape(p0)}\.default\.createElement\((?P<Re1>{JS_ID}),"
+        rf"\{{isOpen:{re.escape(m_fe1.group('G'))},"
+        rf"onClose:\(\)=>{re.escape(m_hist.group('setterUsed'))}\(!1\),",
+        body,
+    )
+    if m_re1 is None:
+        raise RuntimeError("Could not find Re1 recent-sessions component invocation")
+
+    # Walk the parenthesis depth from m_re1.start() to find the matching close.
+    # m_re1 begins with `p0.default.createElement(`. Count parens from there.
+    re1_open_idx = fe1_start + m_re1.start()
+    re1_paren_idx = text.index("(", re1_open_idx)
+    depth = 0
+    re1_close_idx = -1
+    i = re1_paren_idx
+    while i < fe1_end:
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                re1_close_idx = i + 1
+                break
+        i += 1
+    if re1_close_idx < 0:
+        raise RuntimeError("Could not bracket the Re1 createElement call")
+
+    re1_args = text[re1_paren_idx + 1 : re1_close_idx - 1]
+
+    # Filter hook anchor: `[N,E]=p0.useState(null),y=p0.useCallback((b)=>{setTimeout(()=>{let t=gn1(b.milestoneId)`
+    m_filter = re.search(
+        rf"\[(?P<N>{JS_ID}),(?P<E>{JS_ID})\]={re.escape(p0)}\.useState\(null\),"
+        rf"(?P<y>{JS_ID})={re.escape(p0)}\.useCallback\(\((?P<bp>{JS_ID})\)=>"
+        rf"\{{setTimeout\(\(\)=>\{{let\s+(?P<t>{JS_ID})=(?P<gn1>{JS_ID})\((?P=bp)\.milestoneId\)",
+        body,
+    )
+    if m_filter is None:
+        raise RuntimeError("Could not find filter useCallback / gn1 anchor")
+    gn1 = m_filter.group("gn1")
+
+    return {
+        "p0": p0,
+        "h6": h6,
+        "fn": m_fe1.group("fn"),
+        "$": m_fe1.group("S"),
+        "Z": m_fe1.group("C"),
+        "QQ": m_hist.group("QQ"),
+        "in1": m_hist.group("in1"),
+        "G_state": m_hist.group("stateUsed"),
+        "q_setter": m_hist.group("setterUsed"),
+        "X_ref": m_hist.group("refUsed"),
+        "Re1": m_re1.group("Re1"),
+        "re1_call_start": re1_open_idx,
+        "re1_call_end": re1_close_idx,
+        "re1_args": re1_args,
+        "body_anchor": body_anchor,
+        "gn1": gn1,
+        "filter_anchor_start": fe1_start + m_filter.start(),
+        "filter_anchor_end": fe1_start + m_filter.end(),
+        # Header toggle absolute offset for block 10
+        "hist_call_start": fe1_start + m_hist.start(),
+        "hist_call_end": fe1_start + m_hist.end(),
+    }
+
+
+def _re1_pick(args: str, prop: str) -> str | None:
+    """Extract a top-level value for ``prop:`` from a flat React-props block.
+
+    The Re1 invocation we mirror is one big `{k1:v1,k2:v2,...}` literal. We
+    walk paren/brace/bracket depth so we can grab a value even if it contains
+    commas (e.g. `[...x].sort((a,b)=>a-b)`).
+    """
+    idx = 0
+    needle = prop + ":"
+    while True:
+        i = args.find(needle, idx)
+        if i < 0:
+            return None
+        # Make sure this `prop:` is at top depth (preceded by `,` or start).
+        prev = args[i - 1] if i > 0 else ","
+        if prev not in (",", "{"):
+            idx = i + 1
+            continue
+        j = i + len(needle)
+        depth_paren = depth_brace = depth_brack = 0
+        in_str: str | None = None
+        in_tpl = False
+        k = j
+        while k < len(args):
+            c = args[k]
+            if in_str is not None:
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == in_str:
+                    in_str = None
+                k += 1
+                continue
+            if in_tpl:
+                if c == "\\":
+                    k += 2
+                    continue
+                if c == "`":
+                    in_tpl = False
+                k += 1
+                continue
+            if c in "\"'":
+                in_str = c
+                k += 1
+                continue
+            if c == "`":
+                in_tpl = True
+                k += 1
+                continue
+            if c == "(":
+                depth_paren += 1
+            elif c == ")":
+                if depth_paren == 0:
+                    return args[j:k]
+                depth_paren -= 1
+            elif c == "{":
+                depth_brace += 1
+            elif c == "}":
+                if depth_brace == 0:
+                    return args[j:k]
+                depth_brace -= 1
+            elif c == "[":
+                depth_brack += 1
+            elif c == "]":
+                if depth_brack == 0:
+                    return args[j:k]
+                depth_brack -= 1
+            elif c == "," and depth_paren == depth_brace == depth_brack == 0:
+                return args[j:k]
+            k += 1
+        return args[j:]
 
 
 def patch_webview_js(webview_js: Path) -> bool:
     text = read(webview_js)
-    changed = False
-    anchor = "var _R0=16,wR0=1000;"
-    if anchor not in text:
-        raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "function ccPatchFilterSort(" not in text:
-        # Upgrade path: an older helper block may already be present. Strip it
-        # back to the anchor, then re-inject the current helper block. The
-        # freshness marker bumps with each helper-block revision so older
-        # patched installs always get re-stamped to the current version.
-        helper_start = text.find("function ccPatchTitle(")
-        if helper_start != -1:
-            anchor_pos = text.find(anchor, helper_start)
-            if anchor_pos == -1:
-                raise RuntimeError("Found old Claude helper block but lost anchor")
-            text = text[:helper_start] + text[anchor_pos:]
-        text = text.replace(anchor, CLAUDE_HELPER_JS + anchor, 1)
-        changed = True
 
-    old_sort = "}):_1,t=S0.useRef(F);"
-    new_sort = "}):_1;{let[T1,K1]=S0.useState(0);S0.useEffect(()=>{let M1=()=>K1((q1)=>q1+1);ccPatchFilterListeners.add(M1);return()=>{ccPatchFilterListeners.delete(M1)}},[])}b=ccPatchFilterSort(b);let t=S0.useRef(F);"
-    if old_sort in text:
-        text = text.replace(old_sort, new_sort, 1)
-        changed = True
-    # Upgrade path: v0.3.x sorted without filtering — promote to combined filter+sort.
-    legacy_sort_only = "}):_1;b=[...b].sort(ccPatchSortSessions);let t=S0.useRef(F);"
-    if legacy_sort_only in text:
-        text = text.replace(legacy_sort_only, new_sort, 1)
-        changed = True
+    # If the helper is already injected we treat the file as patched.
+    if "function ccPatchTitle(" in text:
+        return False
 
-    old_status_hook = "z6();let j=S0.useRef(null),D=S0.useRef(!0);"
-    new_status_hook = "z6();let j=S0.useRef(null),D=S0.useRef(!0),[L,I]=S0.useState(0);S0.useEffect(()=>{ccPatchTrackSessionStatus(Z,()=>I(M=>M+1))},[Z,Z.busy?.value]);"
-    if old_status_hook in text:
-        text = text.replace(old_status_hook, new_status_hook, 1)
-        changed = True
+    rs = _capture_rs_component(text)
+    or0 = _capture_or0_component(text, S0=rs["S0"], w2=rs["w2"])
+    nr0 = _capture_nr0(text)
+    fe1 = _capture_fe1_component(text)
 
-    old_context = 'return S0.default.createElement("button",{ref:F,className:`${w2.sessionItem} ${J?w2.active:""} ${Y?w2.focused:""}`,onClick:X?void 0:G,onMouseMove:q},'
-    new_context = 'return S0.default.createElement("button",{ref:F,className:`${w2.sessionItem} ${J?w2.active:""} ${Y?w2.focused:""}`,onClick:X?void 0:(M)=>{ccPatchClearDone(Z),I(W5=>W5+1),G(M)},onMouseMove:q,onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchToggleStarTitle(Z)),ccPatchIsPinned(Z)?"Unpin":"Pin",ccPatchIsStarred(Z)?"Unstar":"Star")}},'
-    if old_context in text:
-        text = text.replace(old_context, new_context, 1)
-        changed = True
-    # Upgrade path: replace the v0.1.x / v0.2.0 context handler (hardcoded labels, one-way Star) with the v0.2.1 form.
-    legacy_context_handler = "onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchStarTitle(Z)))}"
-    new_context_handler = 'onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchToggleStarTitle(Z)),ccPatchIsPinned(Z)?"Unpin":"Pin",ccPatchIsStarred(Z)?"Unstar":"Star")}'
-    if legacy_context_handler in text:
-        text = text.replace(legacy_context_handler, new_context_handler, 1)
-        changed = True
+    # Sanity-check that the React aliases inside fe1 and Rs are independent of
+    # each other (different bundles split them into different chunks).
+    if fe1["p0"] == rs["S0"]:
+        # Acceptable; some bundles share the alias.
+        pass
 
-    # Upgrade path: strip the data-cc-state debug attribute if present from earlier dev builds.
-    text = text.replace('"data-cc-state":ccPatchDebugState(Z),', "")
+    # ──────────────────────────────────────────────────────────────────────
+    # Helper aliases — these shorten the f-strings below.
+    # ──────────────────────────────────────────────────────────────────────
+    S0 = rs["S0"]
+    w2 = rs["w2"]
+    Rs_fn = rs["fn"]
+    OR0 = or0["OR0"]
+    p0 = fe1["p0"]
+    h6 = fe1["h6"]
 
-    old_status_var = "let _=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
-    new_status_var = "let R1=ccPatchSessionIndicator(Z,J),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
-    if old_status_var in text:
-        text = text.replace(old_status_var, new_status_var, 1)
-        changed = True
-    # Upgrade path: v0.2.0..v0.2.2 passed only Z; bring it to the active-aware 2-arg form.
-    legacy_status_var = "let R1=ccPatchSessionIndicator(Z),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
-    if legacy_status_var in text:
-        text = text.replace(legacy_status_var, new_status_var, 1)
-        changed = True
+    # Row vars (OR0).
+    Z = or0["Z"]
+    J = or0["J"]
+    Y = or0["Y"]
+    X = or0["X"]
+    Q = or0["Q"]
+    G = or0["G"]
+    q = or0["q"]
+    z = or0["z"]
+    H = or0["H"]
+    B = or0["B"]
+    W = or0["W"]
+    F_row = or0["F"]
+    j = or0["j"]
+    A = or0["A"]
+    P = or0["P"]
+    Kk = or0["Kk"]
+    Le1 = or0["Le1"]
+    sa = or0["sa"]
+    Ne1 = or0["Ne1"]
+    underscore = or0["underscore"]
 
-    old_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'
-    new_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),R1&&S0.default.createElement("span",{className:`claudePatchStatus claudePatchStatus${R1.charAt(0).toUpperCase()}${R1.slice(1)}`,title:R1==="running"?"Running":R1==="waiting"?"Waiting for your reply":"Completed"}),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'
-    if old_status_insert in text:
-        text = text.replace(old_status_insert, new_status_insert, 1)
-        changed = True
-    # Upgrade path: replace the legacy 2-state status span with the 3-state one.
-    legacy_status_span = 'R1&&S0.default.createElement("span",{className:`claudePatchStatus ${R1==="running"?"claudePatchStatusRunning":"claudePatchStatusDone"}`,title:R1==="running"?"Running":"Completed"})'
-    new_status_span = 'R1&&S0.default.createElement("span",{className:`claudePatchStatus claudePatchStatus${R1.charAt(0).toUpperCase()}${R1.slice(1)}`,title:R1==="running"?"Running":R1==="waiting"?"Waiting for your reply":"Completed"})'
-    if legacy_status_span in text:
-        text = text.replace(legacy_status_span, new_status_span, 1)
-        changed = True
+    # Outer (Rs) locals.
+    b_var = rs["b"]
+    _1 = rs["_1"]
+    F_outer = rs["F"]
+    t_outer = rs["t"]
+    K1 = rs["K1"]
+    H1 = rs["H1"]
+    s_var = rs["s"]
+    p_var = rs["p"]
+    w_var = rs["w"]
+    O_var = rs["O"]
+    E_var = rs["E"]
+    y_var = rs["y"]
+    tab_var = rs["tab"]
+    U_outer = rs["onRenameSession"]
+    V_outer = rs["onDeleteSession"]
+    H_outer = rs["onOpenInNewWindow"]
+    B_outer = rs["currentCwd"]
+    z_outer = rs["onSessionClick"]
+    refMap = rs["$1"]
 
-    old_inline = (
-        'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:h6.content},'
+    # ──────────────────────────────────────────────────────────────────────
+    # 1. Inject the helper JS just before `var <_R0>=<n>,<wR0>=<n>;`.
+    # ──────────────────────────────────────────────────────────────────────
+    helper_anchor_re = re.compile(rf"var\s+{re.escape(rs['_R0'])}=\d+,{re.escape(rs['wR0'])}=\d+;")
+    m_helper_anchor = helper_anchor_re.search(text)
+    if m_helper_anchor is None:
+        raise RuntimeError("Lost helper-injection anchor after capture")
+    text = text[: m_helper_anchor.start()] + CLAUDE_HELPER_JS + text[m_helper_anchor.start() :]
+
+    # All captured indices into the OLD text are now invalid; we re-locate by
+    # regex from this point forward.
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 2. Sort block — `}):<_1>,<t>=<S0>.useRef(<F>);`
+    # ──────────────────────────────────────────────────────────────────────
+    sort_re = re.compile(
+        rf"\}}\):{re.escape(_1)},{re.escape(t_outer)}={re.escape(S0)}\.useRef\({re.escape(F_outer)}\);"
     )
-    new_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:ccPatchFilterSort(u),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:ccPatchFilterSort(o),remoteConnected:$.remoteConnected.value,remoteReconnecting:$.remoteReconnecting.value,remoteSessionsLoaded:$.remoteSessionsLoaded.value,onReconnectRemote:()=>{$.listRemoteSessions()},activeSession:$.activeSession.value||null,onSessionClick:x,onRenameSession:s,onDeleteSession:_1,onOpenInNewWindow:Z.host!=="jetbrains"?r:void 0,currentCwd:Z.defaultCwd.value,authMethod:Z.authStatus.value?.authMethod,onRefresh:()=>{$.listSessions(),$.listRemoteSessions()},onOpenURL:Z.openURL})),p0.default.createElement("div",{className:"claudePatchResizeHandle",onPointerDown:ccPatchStartResize}),p0.default.createElement("div",{className:`${h6.content} claudePatchMainContent`},'
-    if old_inline in text:
-        text = text.replace(old_inline, new_inline, 1)
-        changed = True
-    # Upgrade path: v0.3.x used .sort() inline without filtering.
-    legacy_inline_sort = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:[...u].sort(ccPatchSortSessions),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:[...o].sort(ccPatchSortSessions),'
-    new_inline_sort_prefix = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:ccPatchFilterSort(u),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:ccPatchFilterSort(o),'
-    if legacy_inline_sort in text:
-        text = text.replace(legacy_inline_sort, new_inline_sort_prefix, 1)
-        changed = True
-
-    old_rewind = "let B=q?.filesChanged&&q.filesChanged.length>0,W=q?.canRewind&&!Q&&(B||J);"
-    new_rewind = "let B=q?.filesChanged&&q.filesChanged.length>0,W=q?.canRewind&&!Q;"
-    if old_rewind in text:
-        text = text.replace(old_rewind, new_rewind, 1)
-        changed = True
-
-    old_history_btn = 'p0.default.createElement(QQ,{ref:X,ariaLabel:"Session history",iconSize:20,onClick:()=>q(!G)},p0.default.createElement(in1,null))'
-    toggle_btn = 'p0.default.createElement(QQ,{ariaLabel:"Toggle session pane",iconSize:20,onClick:ccPatchToggleSessions},p0.default.createElement("span",{className:"claudePatchSidebarIcon","aria-hidden":"true"}))'
-    new_history_btn = toggle_btn + "," + old_history_btn
-    if old_history_btn in text and toggle_btn not in text:
-        text = text.replace(old_history_btn, new_history_btn, 1)
-        changed = True
-
-    # Filter button: sits to the LEFT of the toggle (sidebar collapse) button. Renders a
-    # multi-select flyout (Type/Age groups) and re-renders the session lists when filters
-    # change. Active-filter dot is driven by a CSS class set on the button at render time.
-    filter_btn = (
-        'p0.default.createElement(QQ,{ariaLabel:"Filter sessions",iconSize:20,'
-        'className:ccPatchFiltersActive()?"claudePatchFilterButton claudePatchFilterButtonActive":"claudePatchFilterButton",'
-        'onClick:ccPatchShowFilterMenu},'
-        'p0.default.createElement("span",{className:"claudePatchFilterIcon","aria-hidden":"true"}))'
+    m_sort = sort_re.search(text)
+    if m_sort is None:
+        raise RuntimeError("Lost sort anchor after helper injection")
+    new_sort = (
+        f"}}):{_1};{b_var}=ccPatchFilterSort({b_var});"
+        f"let [ccPatchArchState,ccPatchSetArchState]={S0}.useState(()=>localStorage.getItem('ccPatchArchiveOpen')==='true');"
+        f"let [ccPatchPinState,ccPatchSetPinState]={S0}.useState(()=>localStorage.getItem('ccPatchPinOpen')!=='false');"
+        f"let [ccPatchStarState,ccPatchSetStarState]={S0}.useState(()=>localStorage.getItem('ccPatchStarOpen')!=='false');"
+        f"{{let[ccPFT,ccPFS]={S0}.useState(0);"
+        f"{S0}.useEffect(()=>{{let M=()=>ccPFS((v)=>v+1);ccPatchFilterListeners.add(M);return()=>ccPatchFilterListeners.delete(M)}},[])}}"
+        f"let {t_outer}={S0}.useRef({F_outer});"
     )
-    new_with_filter = filter_btn + "," + toggle_btn
-    if toggle_btn in text and filter_btn not in text:
-        text = text.replace(toggle_btn, new_with_filter, 1)
-        changed = True
+    text = text[: m_sort.start()] + new_sort + text[m_sort.end() :]
 
-    # Subscribe the header component to filter changes so toggling filter checkboxes
-    # re-renders both the filter-button active state and the inline session list.
-    # The original code is one big comma-sequence expression, so we splice in a
-    # useState (for the tick) and a useEffect (to subscribe) as further expressions
-    # in the same sequence — no statement-level reshuffling.
-    # The injection point sits inside one big `let P=...,A=...,y=p0.useCallback(...)`
-    # declarator list. Every comma-separated item MUST be `binding = init`, so the
-    # subscription useEffect has to be assigned to a throwaway binding rather than
-    # called bare.
-    filter_hook_anchor = "[N,E]=p0.useState(null),y=p0.useCallback((b)=>{setTimeout(()=>{let t=gn1(b.milestoneId)"
-    filter_hook_inject = (
-        "[N,E]=p0.useState(null),"
-        "[ccPatchFiltersTick,ccPatchFiltersSetTick]=p0.useState(0),"
-        "ccPatchFiltersEffect=p0.useEffect(()=>{let ccPatchFL=()=>ccPatchFiltersSetTick((ccPatchFTV)=>ccPatchFTV+1);"
-        "ccPatchFilterListeners.add(ccPatchFL);return()=>{ccPatchFilterListeners.delete(ccPatchFL)}},[]),"
-        "y=p0.useCallback((b)=>{setTimeout(()=>{let t=gn1(b.milestoneId)"
+    # ──────────────────────────────────────────────────────────────────────
+    # 3. Status hook — `<init>();let <j>=<S0>.useRef(null),<D>=<S0>.useRef(!0);`
+    # ──────────────────────────────────────────────────────────────────────
+    D = or0["D"]
+    hook_re = re.compile(
+        rf"(?P<init>{JS_ID})\(\);let\s+{re.escape(j)}={re.escape(S0)}\.useRef\(null\),"
+        rf"{re.escape(D)}={re.escape(S0)}\.useRef\(!0\);"
     )
-    if filter_hook_anchor in text and "ccPatchFiltersTick" not in text:
-        text = text.replace(filter_hook_anchor, filter_hook_inject, 1)
-        changed = True
+    m_hook = hook_re.search(text)
+    if m_hook is None:
+        raise RuntimeError("Lost OR0 status-hook anchor")
+    new_hook = (
+        f"{m_hook.group('init')}();"
+        f"let {j}={S0}.useRef(null),{D}={S0}.useRef(!0),"
+        f"[L,I]={S0}.useState(0);"
+        f"{S0}.useEffect(()=>{{ccPatchTrackSessionStatus({Z},()=>I(M=>M+1))}},[{Z},{Z}.busy?.value]);"
+    )
+    text = text[: m_hook.start()] + new_hook + text[m_hook.end() :]
 
-    if changed:
-        write(webview_js, text)
-    return changed
+    # ──────────────────────────────────────────────────────────────────────
+    # 5. Capture status indicator variable — must precede block 4 because the
+    #    new block-4 button-onClick references `I` and we want our `R1` set
+    #    up before that. Block 5's anchor sits just BEFORE the button start.
+    # ──────────────────────────────────────────────────────────────────────
+    status_var_re = re.compile(
+        rf"let\s+{re.escape(underscore)}={re.escape(J)}&&!{re.escape(Z)}\.summary\.value"
+        rf"&&!{re.escape(Z)}\.messages\.value\.length"
+        rf"&&!{re.escape(Z)}\.teleportedMessageCount\.value;return"
+    )
+    m_sv = status_var_re.search(text)
+    if m_sv is None:
+        raise RuntimeError("Lost OR0 status-var anchor")
+    new_sv = (
+        f"let R1=ccPatchSessionIndicator({Z},{J}),"
+        f"{underscore}={J}&&!{Z}.summary.value&&!{Z}.messages.value.length"
+        f"&&!{Z}.teleportedMessageCount.value;return"
+    )
+    text = text[: m_sv.start()] + new_sv + text[m_sv.end() :]
 
+    # ──────────────────────────────────────────────────────────────────────
+    # 4. Right-click context menu — patches the row <button> opening.
+    # ──────────────────────────────────────────────────────────────────────
+    btn_re = re.compile(
+        rf'return {re.escape(S0)}\.default\.createElement\("button",'
+        rf"\{{ref:{re.escape(F_row)},className:`\$\{{{re.escape(w2)}\.sessionItem\}} "
+        rf'\$\{{{re.escape(J)}\?{re.escape(w2)}\.active:""\}} '
+        rf'\$\{{{re.escape(Y)}\?{re.escape(w2)}\.focused:""\}}`,'
+        rf"onClick:{re.escape(X)}\?void 0:{re.escape(G)},onMouseMove:{re.escape(q)}\}},"
+    )
+    m_btn = btn_re.search(text)
+    if m_btn is None:
+        raise RuntimeError("Lost OR0 row-button anchor")
+    new_btn = (
+        f'return {S0}.default.createElement("button",'
+        f"{{ref:{F_row},className:`${{{w2}.sessionItem}} ccPatchSessionItem "
+        f'${{{J}?{w2}.active:""}} ${{{Y}?{w2}.focused:""}}`,'
+        f"onClick:{X}?void 0:(M)=>{{ccPatchClearDone({Z}),I(W5=>W5+1),{G}(M)}},onMouseMove:{q},"
+        f"onContextMenu:(M)=>{{if({z}&&{Z}.sessionId.value)M.preventDefault(),M.stopPropagation(),"
+        f"ccPatchShowMenu(M.clientX,M.clientY,"
+        f"ccPatchIsPinned({Z})?`Unpin`:`Pin`,()=>ccPatchTogglePin({Z}),"
+        f"ccPatchIsStarred({Z})?`Unstar`:`Star`,()=>ccPatchToggleStar({Z}),"
+        f"ccPatchIsArchived({Z})?{{label:`Unarchive`,fn:()=>ccPatchToggleArchive({Z})}}:{{label:`Archive`,fn:()=>ccPatchToggleArchive({Z})}})}}}},"
+    )
+    text = text[: m_btn.start()] + new_btn + text[m_btn.end() :]
 
-CSS_SENTINEL_START = "/*claudePatch:start*/"
-CSS_SENTINEL_END = "/*claudePatch:end*/"
+    # ──────────────────────────────────────────────────────────────────────
+    # 6. Status dot + stacked name/time row.
+    # ──────────────────────────────────────────────────────────────────────
+    si_re = re.compile(
+        rf'{re.escape(X)}\?{re.escape(S0)}\.default\.createElement\("span",'
+        rf"\{{ref:{re.escape(j)},className:`\$\{{{re.escape(w2)}\.sessionName\}} "
+        rf"\$\{{{re.escape(w2)}\.sessionNameEditing\}}`,"
+        rf"contentEditable:!0,suppressContentEditableWarning:!0,"
+        rf"onKeyDown:{re.escape(A)},onBlur:{re.escape(P)},"
+        rf"onClick:\(M\)=>M\.stopPropagation\(\)\}},{re.escape(Kk)}\({re.escape(Z)}\)\):"
+        rf'{re.escape(S0)}\.default\.createElement\("span",\{{className:{re.escape(w2)}\.sessionName\}},'
+        rf"{re.escape(Le1)}\({re.escape(Kk)}\({re.escape(Z)}\),{re.escape(Q)}\)\),"
+        rf"{re.escape(B)}&&{re.escape(Z)}\.worktree\.value&&{re.escape(Z)}\.worktree\.value\.path!=={re.escape(W)}&&"
+    )
+    m_si = si_re.search(text)
+    if m_si is None:
+        raise RuntimeError("Lost OR0 status-insert anchor")
+    new_si = (
+        f'{S0}.default.createElement("span",{{className:"claudePatchStatus "'
+        f'+(R1==="running"?"claudePatchStatusRunning":R1==="waiting"?"claudePatchStatusWaiting":R1==="done"?"claudePatchStatusDone":"claudePatchStatusIdle"),'
+        f'title:R1==="running"?"Running":R1==="waiting"?"Waiting for input":R1==="done"?"Completed":""}}),'
+        f"{X}?"
+        f'{S0}.default.createElement("div",{{className:"ccPatchRowInner ccPatchRowInnerEdit"}},'
+        f'{S0}.default.createElement("span",{{ref:{j},className:`${{{w2}.sessionName}} ${{{w2}.sessionNameEditing}}`,'
+        f"contentEditable:!0,suppressContentEditableWarning:!0,onKeyDown:{A},onBlur:{P},"
+        f"onClick:(M)=>M.stopPropagation()}},{Kk}({Z})))"
+        f":"
+        f'{S0}.default.createElement("div",{{className:"ccPatchRowInner"}},'
+        f'{S0}.default.createElement("span",{{className:{w2}.sessionName+" ccPatchRowName",'
+        f"onDoubleClick:(M)=>{{M.stopPropagation(),{z}&&{z}({Z})}}}},{Le1}({Kk}({Z}),{Q})),"
+        f'{S0}.default.createElement("span",{{className:"ccPatchRowTime"}},'
+        f'R1==="running"||R1==="waiting"?ccPatchActivityText({Z})||{nr0}({Z}.lastModifiedTime.value):{nr0}({Z}.lastModifiedTime.value))'
+        f"),"
+        f"{B}&&{Z}.worktree.value&&{Z}.worktree.value.path!=={W}&&"
+    )
+    text = text[: m_si.start()] + new_si + text[m_si.end() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 7. Replace the entire sessionMeta hover-actions block.
+    # ──────────────────────────────────────────────────────────────────────
+    # Inline SVG icons (dynamic on S0 + Z).
+    icon_pin = (
+        f'{S0}.default.createElement("svg",{{width:12,height:12,viewBox:"0 0 12 12","aria-hidden":true}},'
+        f'{S0}.default.createElement("circle",{{cx:6,cy:4.5,r:2.5,'
+        f'fill:ccPatchIsPinned({Z})?"currentColor":"none",'
+        f'stroke:"currentColor",strokeWidth:1.5}}),'
+        f'{S0}.default.createElement("line",{{x1:6,y1:7,x2:6,y2:11.5,'
+        f'stroke:"currentColor",strokeWidth:1.5}}))'
+    )
+    icon_star = (
+        f'{S0}.default.createElement("svg",{{width:12,height:12,viewBox:"0 0 12 12","aria-hidden":true}},'
+        f'{S0}.default.createElement("polygon",{{points:"6,1.5 7.2,4.5 10.5,4.9 8.2,7.1 8.8,10.5 6,9 3.2,10.5 3.8,7.1 1.5,4.9 4.8,4.5",'
+        f'fill:ccPatchIsStarred({Z})?"currentColor":"none",'
+        f'stroke:"currentColor",strokeWidth:1.2,strokeLinejoin:"round"}}))'
+    )
+    icon_archive = (
+        f'{S0}.default.createElement("svg",{{width:12,height:12,viewBox:"0 0 12 12",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.2,strokeLinecap:"round","aria-hidden":true}},'
+        f'{S0}.default.createElement("rect",{{x:1,y:2,width:10,height:2.5,rx:0.5}}),'
+        f'{S0}.default.createElement("path",{{d:"M2 4.5v5h8v-5"}}),'
+        f'{S0}.default.createElement("line",{{x1:6,y1:6,x2:6,y2:8.5}}),'
+        f'{S0}.default.createElement("polyline",{{points:"4.5,7 6,8.5 7.5,7"}}))'
+    )
+    icon_trash = (
+        f'{S0}.default.createElement("svg",{{width:12,height:12,viewBox:"0 0 12 12",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.2,strokeLinecap:"round","aria-hidden":true}},'
+        f'{S0}.default.createElement("line",{{x1:1.5,y1:3,x2:10.5,y2:3}}),'
+        f'{S0}.default.createElement("path",{{d:"M3 3l.8 8h4.4l.8-8"}}),'
+        f'{S0}.default.createElement("path",{{d:"M4.5 3V2h3v1"}}))'
+    )
+    meta_re = re.compile(
+        rf',{re.escape(S0)}\.default\.createElement\("span",\{{className:{re.escape(w2)}\.sessionMeta\}},'
+        rf'{re.escape(S0)}\.default\.createElement\("span",\{{className:{re.escape(w2)}\.sessionTime\}},'
+        rf"{re.escape(nr0)}\({re.escape(Z)}\.lastModifiedTime\.value\)\),"
+        rf"!{re.escape(X)}&&!{re.escape(underscore)}&&\({re.escape(z)}\|\|{re.escape(H)}\)"
+        rf'&&{re.escape(S0)}\.default\.createElement\("span",\{{className:{re.escape(w2)}\.sessionActions\}},'
+        rf"{re.escape(z)}&&{re.escape(Z)}\.sessionId\.value"
+        rf'&&{re.escape(S0)}\.default\.createElement\("span",\{{role:"button",tabIndex:0,'
+        rf"className:{re.escape(w2)}\.actionButton,"
+        rf"onClick:\(M\)=>\{{M\.stopPropagation\(\),{re.escape(z)}\({re.escape(Z)}\)\}},"
+        rf'onKeyDown:\(M\)=>\{{if\(M\.key==="Enter"\|\|M\.key===" "\)M\.preventDefault\(\),M\.stopPropagation\(\),{re.escape(z)}\({re.escape(Z)}\)\}},'
+        rf'title:"Rename session"\}},'
+        rf"{re.escape(S0)}\.default\.createElement\({re.escape(sa)},\{{className:{re.escape(w2)}\.actionIcon\}}\)\),"
+        rf'{re.escape(H)}&&{re.escape(S0)}\.default\.createElement\("span",\{{role:"button",tabIndex:0,'
+        rf"className:`\$\{{{re.escape(w2)}\.actionButton\}} \$\{{{re.escape(w2)}\.deleteButton\}}`,"
+        rf"onClick:\(M\)=>\{{M\.stopPropagation\(\),{re.escape(H)}\({re.escape(Z)}\)\}},"
+        rf'onKeyDown:\(M\)=>\{{if\(M\.key==="Enter"\|\|M\.key===" "\)M\.preventDefault\(\),M\.stopPropagation\(\),{re.escape(H)}\({re.escape(Z)}\)\}},'
+        rf'title:"Delete session"\}},'
+        rf"{re.escape(S0)}\.default\.createElement\({re.escape(Ne1)},\{{className:{re.escape(w2)}\.actionIcon\}}\)"
+        rf"\)\)\)\)\}}\);"
+    )
+    m_meta = meta_re.search(text)
+    if m_meta is None:
+        raise RuntimeError("Lost OR0 sessionMeta hover-actions anchor")
+    new_meta = (
+        f',{S0}.default.createElement("div",{{className:"ccPatchRowActions"}},'
+        f'{S0}.default.createElement("span",{{role:"button",tabIndex:0,'
+        f"className:`${{{w2}.actionButton}} ccPatchActionBtn ccPatchStarBtn`,"
+        f"onClick:(M)=>{{M.stopPropagation(),ccPatchToggleStar({Z})}},"
+        f'title:ccPatchIsStarred({Z})?"Unstar":"Star"}},' + icon_star + "),"
+        f'{S0}.default.createElement("span",{{role:"button",tabIndex:0,'
+        f"className:`${{{w2}.actionButton}} ccPatchActionBtn ccPatchPinBtn`,"
+        f"onClick:(M)=>{{M.stopPropagation(),ccPatchTogglePin({Z})}},"
+        f'title:ccPatchIsPinned({Z})?"Unpin":"Pin"}},' + icon_pin + "),"
+        f"(ccPatchIsArchived({Z})"
+        f'?{H}&&{S0}.default.createElement("span",{{role:"button",tabIndex:0,'
+        f"className:`${{{w2}.actionButton}} ccPatchActionBtn ccPatchDeleteBtn`,"
+        f"onClick:(M)=>{{M.stopPropagation(),{H}({Z})}},"
+        f'title:"Delete permanently"}},' + icon_trash + ")"
+        f':{S0}.default.createElement("span",{{role:"button",tabIndex:0,'
+        f"className:`${{{w2}.actionButton}} ccPatchActionBtn ccPatchArchiveBtn`,"
+        f"onClick:(M)=>{{M.stopPropagation(),ccPatchToggleArchive({Z})}},"
+        f'title:"Archive"}},' + icon_archive + "))"
+        ")"
+        ")});"
+    )
+    text = text[: m_meta.start()] + new_meta + text[m_meta.end() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 8. Rewrite the time formatter. We don't pin local var letters because
+    #    they may differ across builds — instead capture them in the same
+    #    regex and reuse them.
+    # ──────────────────────────────────────────────────────────────────────
+    nro_re = re.compile(
+        rf"function\s+{re.escape(nr0)}\((?P<p>{JS_ID})\)\{{"
+        rf"let\s+(?P<J>{JS_ID})=Date\.now\(\)-(?P=p),"
+        rf"(?P<Y>{JS_ID})=Math\.floor\((?P=J)/1000\),"
+        rf"(?P<X>{JS_ID})=Math\.floor\((?P=Y)/60\),"
+        rf"(?P<Q>{JS_ID})=Math\.floor\((?P=X)/60\),"
+        rf"(?P<G>{JS_ID})=Math\.floor\((?P=Q)/24\),"
+        rf"(?P<q>{JS_ID})=Math\.floor\((?P=G)/30\),"
+        rf"(?P<z>{JS_ID})=Math\.floor\((?P=G)/365\);"
+        rf"if\((?P=z)>0\)return`\$\{{(?P=z)\}}y`;"
+        rf"if\((?P=q)>0\)return`\$\{{(?P=q)\}}mo`;"
+        rf"if\((?P=G)>0\)return`\$\{{(?P=G)\}}d`;"
+        rf"if\((?P=Q)>0\)return`\$\{{(?P=Q)\}}h`;"
+        rf"if\((?P=X)>0\)return`\$\{{(?P=X)\}}m`;"
+        rf'return"now"\}}'
+    )
+    m_nro = nro_re.search(text)
+    if m_nro is None:
+        raise RuntimeError("Lost NR0 time-formatter anchor")
+    p_var_nro = m_nro.group("p")
+    Jn = m_nro.group("J")
+    Yn = m_nro.group("Y")
+    Xn = m_nro.group("X")
+    Qn = m_nro.group("Q")
+    Gn = m_nro.group("G")
+    qn = m_nro.group("q")
+    zn = m_nro.group("z")
+    new_nro = (
+        f"function {nr0}({p_var_nro}){{let {Jn}=Date.now()-{p_var_nro},"
+        f"{Yn}=Math.floor({Jn}/1000),{Xn}=Math.floor({Yn}/60),"
+        f"{Qn}=Math.floor({Xn}/60),{Gn}=Math.floor({Qn}/24),"
+        f"{qn}=Math.floor({Gn}/30),{zn}=Math.floor({Gn}/365);"
+        f"if({zn}>0)return {zn}===1?`1 yr ago`:`${{{zn}}} yrs ago`;"
+        f"if({qn}>0)return {qn}===1?`1 mo ago`:`${{{qn}}} mo ago`;"
+        f"if({Gn}>0)return {Gn}===1?`1 day ago`:`${{{Gn}}} days ago`;"
+        f"if({Qn}>0)return {Qn}===1?`1 hr ago`:`${{{Qn}}} hrs ago`;"
+        f"if({Xn}>0)return {Xn}===1?`1 min ago`:`${{{Xn}}} min ago`;"
+        f"return`now`}}"
+    )
+    text = text[: m_nro.start()] + new_nro + text[m_nro.end() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 10. Pane-toggle button — inject before the Session-history button.
+    # ──────────────────────────────────────────────────────────────────────
+    QQ = fe1["QQ"]
+    in1 = fe1["in1"]
+    X_ref = fe1["X_ref"]
+    q_setter = fe1["q_setter"]
+    G_state = fe1["G_state"]
+    hist_re = re.compile(
+        rf"{re.escape(p0)}\.default\.createElement\({re.escape(QQ)},"
+        rf'\{{ref:{re.escape(X_ref)},ariaLabel:"Session history",iconSize:20,'
+        rf"onClick:\(\)=>{re.escape(q_setter)}\(!{re.escape(G_state)}\)\}},"
+        rf"{re.escape(p0)}\.default\.createElement\({re.escape(in1)},null\)\)"
+    )
+    m_hist = hist_re.search(text)
+    if m_hist is None:
+        raise RuntimeError("Lost Session-history toggle anchor")
+    pane_toggle = (
+        f'{p0}.default.createElement({QQ},{{ariaLabel:"Toggle session pane",iconSize:20,'
+        f"onClick:ccPatchTogglePane}},"
+        f'{p0}.default.createElement("svg",{{width:20,height:20,viewBox:"0 0 20 20",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.6,strokeLinecap:"round",strokeLinejoin:"round","aria-hidden":true}},'
+        f'{p0}.default.createElement("rect",{{x:3,y:4,width:14,height:12,rx:1.5}}),'
+        f'{p0}.default.createElement("line",{{x1:8,y1:4,x2:8,y2:16}})))'
+    )
+    # Inject the pane-toggle button immediately before the history button.
+    text = text[: m_hist.start()] + pane_toggle + "," + text[m_hist.start() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 12. Inline sessions panel — splice between h6.body and h6.content.
+    #
+    # We reuse the prop-bindings from the existing Re1 invocation so we get
+    # the parent's callback names without hard-coding them.
+    # ──────────────────────────────────────────────────────────────────────
+    re1_args = fe1["re1_args"]
+    # Pull the bindings we need from the Re1 args.
+    inline_props = {
+        "localSessions": _re1_pick(re1_args, "localSessions"),
+        "localSessionsLoaded": _re1_pick(re1_args, "localSessionsLoaded"),
+        "remoteSessions": _re1_pick(re1_args, "remoteSessions"),
+        "remoteConnected": _re1_pick(re1_args, "remoteConnected"),
+        "remoteReconnecting": _re1_pick(re1_args, "remoteReconnecting"),
+        "remoteSessionsLoaded": _re1_pick(re1_args, "remoteSessionsLoaded"),
+        "onReconnectRemote": _re1_pick(re1_args, "onReconnectRemote"),
+        "activeSession": _re1_pick(re1_args, "activeSession"),
+        "onSessionClick": _re1_pick(re1_args, "onSessionClick"),
+        "onRenameSession": _re1_pick(re1_args, "onRenameSession"),
+        "onDeleteSession": _re1_pick(re1_args, "onDeleteSession"),
+        "onOpenInNewWindow": _re1_pick(re1_args, "onOpenInNewWindow"),
+        "currentCwd": _re1_pick(re1_args, "currentCwd"),
+        "onOpenURL": _re1_pick(re1_args, "onOpenURL"),
+    }
+    missing_props = [k for k, v in inline_props.items() if v is None]
+    if missing_props:
+        raise RuntimeError(f"Re1 call missing props we mirror: {missing_props}")
+
+    fe1_S = fe1["$"]
+    inline_localSessions = f"[...{fe1_S}.sessions.value].sort(ccPatchSortSessions)"
+    inline_remoteSessions = f"[...{fe1_S}.remoteSessions.value].sort(ccPatchSortSessions)"
+    inline_refresh = f"()=>{{{fe1_S}.listSessions(),{fe1_S}.listRemoteSessions()}}"
+    inline_reconnect = f"()=>{{{fe1_S}.listRemoteSessions()}}"
+
+    inline_body = (
+        f'{p0}.default.createElement("div",{{className:{h6}.body}},'
+        f'{p0}.default.createElement("div",{{className:"claudePatchInlineSessions"}},'
+        f'{p0}.default.createElement("div",{{className:"ccPatchSidebarHeader"}},'
+        f'{p0}.default.createElement("span",{{className:"ccPatchSidebarTitle"}},"Sessions"),'
+        f'{p0}.default.createElement("button",{{className:"ccPatchHeaderBtn",title:"Refresh",'
+        f"onClick:{inline_refresh}}},"
+        f'{p0}.default.createElement("svg",{{width:14,height:14,viewBox:"0 0 14 14",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.4,strokeLinecap:"round",strokeLinejoin:"round","aria-hidden":true}},'
+        f'{p0}.default.createElement("path",{{d:"M12 7A5 5 0 1 1 9.5 2.5"}}),'
+        f'{p0}.default.createElement("polyline",{{points:"10,1 12.5,3 10,5"}}))),'
+        f'{p0}.default.createElement("button",{{className:"ccPatchHeaderBtn",title:"Search",'
+        f"onClick:ccPatchToggleSearch}},"
+        f'{p0}.default.createElement("svg",{{width:14,height:14,viewBox:"0 0 14 14",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.4,strokeLinecap:"round","aria-hidden":true}},'
+        f'{p0}.default.createElement("circle",{{cx:6,cy:6,r:4}}),'
+        f'{p0}.default.createElement("line",{{x1:9,y1:9,x2:12.5,y2:12.5}}))),'
+        f'{p0}.default.createElement("button",{{'
+        f'className:ccPatchFiltersActive()?"ccPatchFilterButton ccPatchHeaderBtn ccPatchFilterButtonActive":"ccPatchFilterButton ccPatchHeaderBtn",'
+        f'title:"Filter",onClick:ccPatchShowFilterMenu}},'
+        f'{p0}.default.createElement("span",{{className:"ccPatchFilterIcon","aria-hidden":true}})),'
+        f'{p0}.default.createElement("button",{{className:"ccPatchHeaderBtn",title:"Toggle panel",'
+        f"onClick:ccPatchTogglePane}},"
+        f'{p0}.default.createElement("svg",{{width:14,height:14,viewBox:"0 0 14 14",fill:"none",'
+        f'stroke:"currentColor",strokeWidth:1.3,"aria-hidden":true}},'
+        f'{p0}.default.createElement("rect",{{x:1,y:2,width:12,height:10,rx:1}}),'
+        f'{p0}.default.createElement("line",{{x1:5,y1:2,x2:5,y2:12}})))),'
+        f'{p0}.default.createElement("div",{{className:"ccPatchSearchRow"}},'
+        f'{p0}.default.createElement("input",{{type:"text",className:"ccPatchSearchInput",'
+        f'placeholder:"Search sessions...",'
+        f"onInput:(e)=>ccPatchSetSearch(e.target.value),"
+        f"onKeyDown:(e)=>{{if(e.key===`Escape`)ccPatchToggleSearch()}}}})),"
+        f'{p0}.default.createElement("button",{{className:"ccPatchNewSessionBtn",'
+        f'onClick:()=>{{if(!{fe1["Z"]}.startNewConversationTab()){fe1_S}.createSession()}}}},'
+        f'"New Session"),'
+        f"{p0}.default.createElement({Rs_fn},{{"
+        f"localSessions:{inline_localSessions},"
+        f'localSessionsLoaded:{inline_props["localSessionsLoaded"]},'
+        f"remoteSessions:{inline_remoteSessions},"
+        f'remoteConnected:{inline_props["remoteConnected"]},'
+        f'remoteReconnecting:{inline_props["remoteReconnecting"]},'
+        f'remoteSessionsLoaded:{inline_props["remoteSessionsLoaded"]},'
+        f"onReconnectRemote:{inline_reconnect},"
+        f"activeSession:{fe1_S}.activeSession.value||null,"
+        f'onSessionClick:{inline_props["onSessionClick"]},'
+        f'onRenameSession:{inline_props["onRenameSession"]},'
+        f'onDeleteSession:{inline_props["onDeleteSession"]},'
+        f'onOpenInNewWindow:{inline_props["onOpenInNewWindow"]},'
+        f'currentCwd:{inline_props["currentCwd"]},'
+        f'authMethod:"local",'
+        f"onRefresh:{inline_refresh},"
+        f'onOpenURL:{inline_props["onOpenURL"]}}})),'
+        f'{p0}.default.createElement("div",{{className:"claudePatchResizeHandle",onPointerDown:ccPatchStartResize}}),'
+        f'{p0}.default.createElement("div",{{className:`${{{h6}.content}} claudePatchMainContent`}},'
+    )
+    body_marker = f'{p0}.default.createElement("div",{{className:{h6}.body}},{p0}.default.createElement("div",{{className:{h6}.content}},'
+    if body_marker not in text:
+        raise RuntimeError("Lost h6.body/h6.content marker")
+    text = text.replace(body_marker, inline_body, 1)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 14. Sessions list — wrap the b.map block in star/pin/active/archive sections.
+    # ──────────────────────────────────────────────────────────────────────
+    map_re = re.compile(
+        rf"{re.escape(w2)}\.sessionsList\}},{re.escape(b_var)}\.map\(\((?P<g1>{JS_ID}),(?P<o1>{JS_ID})\)=>\{{"
+        rf"let\s+(?P<h5>{JS_ID})=(?P=o1)==={re.escape(w_var)},"
+        rf"(?P<k2>{JS_ID})={re.escape(p_var)}===(?P=g1)\.sessionId\.value;"
+        rf"return {re.escape(S0)}\.default\.createElement\({re.escape(OR0)},\{{"
+        rf"key:(?P=g1)\.sessionId\.value\?\?(?P=o1),"
+        rf"ref:\((?P<W5>{JS_ID})\)=>\{{if\((?P=W5)\){re.escape(refMap)}\.current\.set\((?P=o1),(?P=W5)\)\}},"
+        rf'session:(?P=g1),isActive:(?P=g1)==={re.escape(rs["activeSession"])},isFocused:(?P=h5),'
+        rf"isRenaming:(?P=k2),searchQuery:{re.escape(y_var)},"
+        rf"onClick:\(\)=>{re.escape(z_outer)}\((?P=g1)\),"
+        rf"onMouseMove:\(\)=>\{{{re.escape(O_var)}\((?P=o1)\),{re.escape(E_var)}\(null\)\}},"
+        rf'onStartRename:{re.escape(tab_var)}==="local"&&{re.escape(U_outer)}\?{re.escape(s_var)}:void 0,'
+        rf"onFinishRename:{re.escape(K1)},onCancelRename:{re.escape(H1)},"
+        rf'onDelete:{re.escape(tab_var)}==="local"&&{re.escape(V_outer)}\?{re.escape(V_outer)}:void 0,'
+        rf'onOpenInNewWindow:{re.escape(tab_var)}==="local"&&{re.escape(H_outer)}\?{re.escape(H_outer)}:void 0,'
+        rf"currentCwd:{re.escape(B_outer)}\}}\)\}}\)\)\)"
+    )
+    m_map = map_re.search(text)
+    if m_map is None:
+        raise RuntimeError("Lost sessions-list b.map anchor")
+    g1 = m_map.group("g1")
+    o1 = m_map.group("o1")
+    h5 = m_map.group("h5")
+    k2 = m_map.group("k2")
+    W5 = m_map.group("W5")
+
+    or0_row = (
+        f"{S0}.default.createElement({OR0},{{"
+        f"key:{g1}.sessionId.value??{o1},"
+        f"ref:function({W5}){{if({W5}){refMap}.current.set({o1},{W5})}},"
+        f'session:{g1},isActive:{g1}==={rs["activeSession"]},isFocused:{h5},'
+        f"isRenaming:{k2},searchQuery:ccPatchSearchQ||{y_var},"
+        f"onClick:function(){{{z_outer}({g1})}},"
+        f"onMouseMove:function(){{{O_var}({o1}),{E_var}(null)}},"
+        f'onStartRename:{tab_var}==="local"&&{U_outer}?{s_var}:void 0,'
+        f"onFinishRename:{K1},onCancelRename:{H1},"
+        f'onDelete:{tab_var}==="local"&&{V_outer}?{V_outer}:void 0,'
+        f'onOpenInNewWindow:{tab_var}==="local"&&{H_outer}?{H_outer}:void 0,'
+        f"currentCwd:{B_outer}}})"
+    )
+    section_header = (
+        f'{S0}.default.createElement("button",{{key:__KEY__,'
+        f'className:__CLS__+(__STATE__?" ccPatchArchiveSectionOpen":""),'
+        f"onClick:function(e){{e.stopPropagation();__SETTER__(function(v){{"
+        f"localStorage.setItem(__LS_KEY__,String(!v));return!v}})}}}},"
+        f'{S0}.default.createElement("span",{{className:"ccPatchArchiveLabel"}},__LABEL__),'
+        f'{S0}.default.createElement("span",{{className:"ccPatchArchiveCount"}},__COUNT__)'
+        f")"
+    )
+
+    def hdr(key: str, cls: str, state_var: str, setter: str, ls_key: str, label: str, count_expr: str) -> str:
+        return (
+            section_header.replace("__KEY__", key)
+            .replace("__CLS__", cls)
+            .replace("__STATE__", state_var)
+            .replace("__SETTER__", setter)
+            .replace("__LS_KEY__", ls_key)
+            .replace("__LABEL__", label)
+            .replace("__COUNT__", count_expr)
+        )
+
+    new_map = (
+        f"{w2}.sessionsList}},(function(){{"
+        f"var ccStar={b_var}.filter(function(s){{return!ccPatchIsArchived(s)&&ccPatchIsStarred(s)}}),"
+        f"ccPin={b_var}.filter(function(s){{return!ccPatchIsArchived(s)&&!ccPatchIsStarred(s)&&ccPatchIsPinned(s)}}),"
+        f"ccAct={b_var}.filter(function(s){{return!ccPatchIsArchived(s)&&!ccPatchIsStarred(s)&&!ccPatchIsPinned(s)}}),"
+        f"ccArch={b_var}.filter(ccPatchIsArchived),"
+        f"items=[],idx=0;"
+        f"if(ccStar.length>0){{items.push("
+        + hdr(
+            '"__star_hdr__"',
+            '"ccPatchArchiveSectionHeader ccPatchStarSection"',
+            "ccPatchStarState",
+            "ccPatchSetStarState",
+            '"ccPatchStarOpen"',
+            '"⭐ Starred"',
+            "ccStar.length",
+        )
+        + ");}"
+        f"ccStar.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
+        f"if(ccPatchStarState)items.push(" + or0_row + ")});"
+        "if(ccPin.length>0){items.push("
+        + hdr(
+            '"__pin_hdr__"',
+            '"ccPatchArchiveSectionHeader ccPatchPinSection"',
+            "ccPatchPinState",
+            "ccPatchSetPinState",
+            '"ccPatchPinOpen"',
+            '"\U0001f4cc Pinned"',
+            "ccPin.length",
+        )
+        + ");}"
+        f"ccPin.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
+        f"if(ccPatchPinState)items.push(" + or0_row + ")});"
+        f"ccAct.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
+        f"items.push(" + or0_row + ")});"
+        "if(ccArch.length>0){items.push("
+        + hdr(
+            '"__arch_hdr__"',
+            '"ccPatchArchiveSectionHeader"',
+            "ccPatchArchState",
+            "ccPatchSetArchState",
+            '"ccPatchArchiveOpen"',
+            '"Archived"',
+            "ccArch.length",
+        )
+        + ");}"
+        f"ccArch.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
+        f'if(ccPatchArchState)items.push({S0}.default.createElement("div",{{key:"__arch_item_"+{o1},className:"ccPatchArchivedItem"}},'
+        + or0_row
+        + "))});"
+        "return items})()"
+        "))"
+    )
+    text = text[: m_map.start()] + new_map + text[m_map.end() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 13. Filter-subscription hook in fe1.
+    # ──────────────────────────────────────────────────────────────────────
+    gn1 = fe1["gn1"]
+    filter_re = re.compile(
+        rf"\[(?P<N>{JS_ID}),(?P<E>{JS_ID})\]={re.escape(p0)}\.useState\(null\),"
+        rf"(?P<y>{JS_ID})={re.escape(p0)}\.useCallback\(\((?P<bp>{JS_ID})\)=>"
+        rf"\{{setTimeout\(\(\)=>\{{let\s+(?P<t>{JS_ID})={re.escape(gn1)}\((?P=bp)\.milestoneId\)"
+    )
+    m_filter = filter_re.search(text)
+    if m_filter is None:
+        raise RuntimeError("Lost fe1 filter useCallback anchor")
+    N = m_filter.group("N")
+    E = m_filter.group("E")
+    y_f = m_filter.group("y")
+    bp = m_filter.group("bp")
+    t_f = m_filter.group("t")
+    new_filter = (
+        f"[{N},{E}]={p0}.useState(null),"
+        f"[ccPatchFTick,ccPatchFSet]={p0}.useState(0),"
+        f"ccPatchFEffect={p0}.useEffect(()=>{{"
+        f"let ccPFL=()=>ccPatchFSet((v)=>v+1);"
+        f"ccPatchFilterListeners.add(ccPFL);"
+        f"return()=>{{ccPatchFilterListeners.delete(ccPFL)}}}},[]),"
+        f"{y_f}={p0}.useCallback(({bp})=>{{setTimeout(()=>{{let {t_f}={gn1}({bp}.milestoneId)"
+    )
+    text = text[: m_filter.start()] + new_filter + text[m_filter.end() :]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 15. Rewind fix — drop the `(B||J)` clause that requires file changes.
+    # ──────────────────────────────────────────────────────────────────────
+    rewind_re = re.compile(
+        rf"let\s+(?P<B>{JS_ID})=(?P<q>{JS_ID})\?\.filesChanged&&(?P=q)\.filesChanged\.length>0,"
+        rf"(?P<W>{JS_ID})=(?P=q)\?\.canRewind&&!(?P<Q>{JS_ID})&&\((?P=B)\|\|(?P<J>{JS_ID})\);"
+    )
+    m_rew = rewind_re.search(text)
+    if m_rew is None:
+        # Non-fatal — older builds without this anchor still apply other patches.
+        log("Note: rewind fix anchor not found; skipping")
+    else:
+        Brw = m_rew.group("B")
+        qrw = m_rew.group("q")
+        Wrw = m_rew.group("W")
+        Qrw = m_rew.group("Q")
+        new_rew = f"let {Brw}={qrw}?.filesChanged&&{qrw}.filesChanged.length>0," f"{Wrw}={qrw}?.canRewind&&!{Qrw};"
+        text = text[: m_rew.start()] + new_rew + text[m_rew.end() :]
+
+    write(webview_js, text)
+    return True
 
 
 def patch_webview_css(webview_css: Path) -> bool:
     text = read(webview_css)
     changed = False
-    anchor = ".dropdown_Wc_2Bg{position:fixed;background:var(--app-menu-background);border:1px solid var(--app-menu-border);display:flex;z-index:1000;outline:none;box-sizing:border-box;border-radius:12px;flex-direction:column;width:min(400px,100vw - 32px);max-height:min(500px,50vh);padding:6px;box-shadow:0 4px 16px #0000001a}"
-    patch_body = (
-        ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}"
-        ".overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}"
-        ".claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}"
-        ".claudePatchInlineSessions>div{height:100%}"
-        ".claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}"
-        ".claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}"
-        "body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}"
-        ".claudePatchSidebarIcon{display:inline-block;width:14px;height:14px;border:1.5px solid currentColor;border-radius:2px;box-sizing:border-box;position:relative;opacity:.9}"
-        ".claudePatchSidebarIcon::after{content:'';position:absolute;top:0;bottom:0;right:0;width:5px;background:currentColor;border-radius:0 .5px .5px 0}"
-        "body.claudePatchSessionsHidden .claudePatchSidebarIcon{opacity:.55}"
-        "body.claudePatchSessionsHidden .claudePatchSidebarIcon::after{background:transparent}"
-        ".claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}"
-        ".claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}"
-        ".claudePatchStatusWaiting{background:var(--vscode-charts-yellow,#f59e0b);box-shadow:0 0 0 0 var(--vscode-charts-yellow,#f59e0b);animation:claudePatchWaitingPulse 1.6s ease-in-out infinite}"
-        ".claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}"
+
+    # ── Discover the per-build hash suffix used on minified CSS modules. ──
+    # Every CSS class generated by the build looks like `<name>_<hash>`. The
+    # hash is shared across all classes from the same module, so we anchor
+    # on `.dropdown_<hash>{` and capture the hash. We then enumerate all the
+    # `.overlay_*` class names that appear with any hash in the stylesheet
+    # so the modal-overlay rule we inject lifts them above our split pane.
+    m_dropdown = re.search(r"\.dropdown_(?P<hash>[A-Za-z0-9_]+)\{", text)
+    if m_dropdown is None:
+        raise RuntimeError("Could not find .dropdown_<hash> CSS anchor")
+    overlay_classes = sorted(set(re.findall(r"\.overlay_[A-Za-z0-9_]+(?=\{)", text)))
+    if not overlay_classes:
+        raise RuntimeError("Could not find any .overlay_<hash> CSS classes to lift")
+    overlay_selector = ",".join(overlay_classes)
+
+    # Anchor on the OPENING of the `.dropdown_<hash>{` rule. We then walk
+    # braces forward to find its closing `}` so we can append our extra
+    # rules immediately after it without relying on the exact body of the
+    # rule (which changes per release).
+    anchor_idx = m_dropdown.start()
+    brace_idx = m_dropdown.end() - 1  # at `{`
+    depth = 0
+    end_idx = -1
+    k = brace_idx
+    while k < len(text):
+        c = text[k]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end_idx = k + 1
+                break
+        k += 1
+    if end_idx < 0:
+        raise RuntimeError("Could not bracket the .dropdown_<hash> rule")
+    old = text[anchor_idx:end_idx]
+    new = old + (
+        # Main content — z-index, proper overflow, flex min sizing
+        ".claudePatchMainContent{position:relative;z-index:2;overflow:hidden;min-width:0;min-height:0}"
+        # All modal overlay classes — raise above split-pane UI, opaque backdrop.
+        # The hash suffix on `.overlay_*` is regenerated per build, so we use
+        # whatever classes the current stylesheet actually defines.
+        f"{overlay_selector}"
+        "{z-index:10000!important;background-color:#000000e6!important}"
+        # Inline sessions panel — flex column so header + sessions stack properly
+        ".claudePatchInlineSessions{order:2;position:relative;z-index:0;"
+        "flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));"
+        "min-width:180px;max-width:75%;min-height:0;"
+        "border-left:1px solid var(--app-primary-border-color);"
+        "display:flex;flex-direction:column;"
+        "overflow:hidden;background:var(--app-primary-background);"
+        "transition:flex-basis .22s ease,opacity .22s ease,min-width .22s ease}"
+        # Rs component fills remaining height below header
+        ".claudePatchInlineSessions>div:last-child{flex:1;min-height:0;overflow:hidden}"
+        # Resize handle
+        ".claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;"
+        "cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}"
+        ".claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{"
+        "opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}"
+        # Pane-hidden: animate to zero (not display:none so transition plays)
+        ".ccPatchPaneHidden .claudePatchInlineSessions"
+        "{flex-basis:0!important;min-width:0!important;opacity:0;pointer-events:none}"
+        ".ccPatchPaneHidden .claudePatchResizeHandle{display:none!important}"
+        # Slim Copilot-style sidebar header
+        ".ccPatchSidebarHeader{flex:0 0 auto;display:flex;align-items:center;"
+        "padding:2px 4px 2px 8px;border-bottom:1px solid var(--app-primary-border-color);"
+        "height:35px;box-sizing:border-box}"
+        ".ccPatchSidebarTitle{flex:1;font-size:11px;font-weight:600;text-transform:uppercase;"
+        "letter-spacing:.06em;opacity:.65;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+        ".ccPatchHeaderBtn{display:inline-flex;align-items:center;justify-content:center;"
+        "background:transparent;border:0;cursor:pointer;width:24px;height:24px;"
+        "border-radius:4px;color:var(--app-secondary-foreground);opacity:.7;padding:0;flex-shrink:0}"
+        ".ccPatchHeaderBtn:hover{background:var(--app-list-hover-background,rgba(255,255,255,.06));"
+        "opacity:1;color:var(--app-primary-foreground)}"
+        # "New Session" standalone full-width button below header
+        ".ccPatchNewSessionBtn{display:block;width:calc(100% - 16px);margin:5px 8px;"
+        "box-sizing:border-box;"
+        "background:var(--app-list-hover-background,rgba(255,255,255,.06));"
+        "border:0;border-radius:5px;color:var(--app-primary-foreground);cursor:pointer;"
+        "font-size:12px;font-weight:500;padding:5px 0;text-align:center}"
+        ".ccPatchNewSessionBtn:hover{background:var(--vscode-list-hoverBackground,rgba(255,255,255,.1))}"
+        # Stacked Copilot-style session row — 48px tall (was 60px, -20%)
+        ".ccPatchSessionItem{display:flex!important;align-items:center!important;"
+        "min-height:48px!important;padding:0 10px!important;gap:6px!important;"
+        "transition:background .12s ease!important;box-sizing:border-box!important}"
+        "button.ccPatchSessionItem:hover{"
+        "background:var(--app-list-hover-background,rgba(255,255,255,.06))!important}"
+        ".ccPatchRowInner{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}"
+        # Edit mode: fill width cleanly, hide action buttons
+        ".ccPatchRowInnerEdit{flex:1;min-width:0}"
+        ".ccPatchRowInnerEdit [contenteditable]{"
+        "display:block;width:100%;min-width:0;outline:none;word-break:break-word}"
+        ".ccPatchRowInnerEdit~.ccPatchRowActions{display:none!important}"
+        ".ccPatchRowName{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.3}"
+        ".ccPatchRowTime{font-size:10.5px;opacity:.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+        # Hover-reveal action buttons panel
+        ".ccPatchRowActions{display:flex;align-items:center;gap:2px;"
+        "flex-shrink:0;opacity:0;transition:opacity .12s}"
+        ".ccPatchSessionItem:hover .ccPatchRowActions,"
+        ".ccPatchSessionItem:focus-within .ccPatchRowActions{opacity:1}"
+        ".ccPatchActionBtn{display:flex!important;align-items:center;justify-content:center;"
+        "background:transparent!important;border:0!important;cursor:pointer;"
+        "padding:3px!important;border-radius:3px!important;"
+        "color:var(--app-secondary-foreground)!important;"
+        "width:22px!important;height:22px!important}"
+        ".ccPatchActionBtn:hover{background:var(--app-list-hover-background)!important;"
+        "color:var(--app-primary-foreground)!important}"
+        # Action button SVG sizing
+        ".ccPatchActionBtn svg{width:12px;height:12px;display:block}"
+        ".ccPatchHeaderBtn svg{width:14px;height:14px;display:block}"
+        ".ccPatchStarBtn:hover{color:var(--vscode-charts-yellow,#f59e0b)!important}"
+        ".ccPatchPinBtn:hover{color:var(--vscode-charts-blue,#3b82f6)!important}"
+        ".ccPatchDeleteBtn:hover{color:var(--vscode-errorForeground,#f87171)!important}"
+        ".ccPatchArchiveBtn:hover{color:var(--vscode-charts-orange,#f59e0b)!important}"
+        # Search row — hidden by default, slides down when .ccPatchSearchActive on panel
+        ".ccPatchSearchRow{overflow:hidden;max-height:0;transition:max-height .2s ease}"
+        ".ccPatchSearchActive .ccPatchSearchRow{max-height:40px}"
+        ".ccPatchSearchInput{display:block;width:calc(100% - 16px);margin:4px 8px;"
+        "box-sizing:border-box;"
+        "background:var(--vscode-input-background,rgba(0,0,0,.18));"
+        "border:1px solid var(--vscode-input-border,transparent);"
+        "border-radius:4px;color:var(--app-primary-foreground);"
+        "font-size:12px;padding:4px 8px;outline:none}"
+        ".ccPatchSearchInput:focus{border-color:var(--vscode-focusBorder,#007acc)}"
+        ".ccPatchSearchInput::placeholder{opacity:.5}"
+        # Status dot — LEFT of row, top-aligned with name text
+        ".claudePatchStatus{display:block;flex:0 0 auto;width:7px;height:7px;"
+        "border-radius:50%;flex-shrink:0;align-self:flex-start;margin-top:12px;"
+        "background:var(--app-secondary-foreground,#888)}"
+        ".claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)!important}"
+        ".claudePatchStatusIdle{opacity:.3}"
+        ".claudePatchStatusRunning{box-sizing:border-box;width:8px;height:8px;"
+        "background:transparent!important;border:2px solid var(--vscode-charts-blue,#3b82f6);"
+        "border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}"
+        ".claudePatchStatusWaiting{background:var(--vscode-charts-yellow,#f59e0b)!important;"
+        "animation:claudePatchWaitPulse 1.4s ease-in-out infinite}"
         "@keyframes claudePatchSpin{to{transform:rotate(360deg)}}"
-        "@keyframes claudePatchWaitingPulse{0%,100%{opacity:1;box-shadow:0 0 0 0 color-mix(in srgb,var(--vscode-charts-yellow,#f59e0b)55%,transparent)}50%{opacity:.85;box-shadow:0 0 0 4px color-mix(in srgb,var(--vscode-charts-yellow,#f59e0b)0%,transparent)}}"
-        ".claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}"
-        ".claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}"
+        "@keyframes claudePatchWaitPulse{0%,100%{opacity:1}50%{opacity:.4}}"
+        # Context menu
+        ".claudePatchContextMenu{position:fixed;z-index:2000;"
+        "background:var(--app-menu-background);border:1px solid var(--app-menu-border);"
+        "border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;"
+        "display:flex;flex-direction:column;min-width:130px}"
+        ".claudePatchContextMenu button{background:transparent;border:0;"
+        "color:var(--app-primary-foreground);text-align:left;padding:6px 10px;"
+        "border-radius:4px;cursor:pointer}"
         ".claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}"
-        ".claudePatchFilterButton{position:relative}"
-        ".claudePatchFilterIcon{display:inline-block;width:14px;height:10px;position:relative;opacity:.9}"
-        ".claudePatchFilterIcon::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:currentColor;border-radius:1px;box-shadow:0 4px 0 0 currentColor,0 8px 0 0 currentColor}"
-        ".claudePatchFilterButtonActive .claudePatchFilterIcon::after{content:'';position:absolute;right:-3px;top:-3px;width:6px;height:6px;border-radius:50%;background:var(--vscode-charts-blue,#3b82f6);border:1.5px solid var(--app-primary-background)}"
-        ".claudePatchFilterButtonOpen .claudePatchFilterIcon{opacity:1}"
-        ".claudePatchFilterMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:8px;padding:6px;box-shadow:0 6px 20px #00000055;display:flex;flex-direction:column;min-width:200px;max-width:280px;font-size:13px;color:var(--app-primary-foreground)}"
-        ".claudePatchFilterGroup{display:flex;flex-direction:column;padding:4px 2px;border-bottom:1px solid var(--app-menu-border)}"
+        # Section headers — VS Code minimal style (starred/pinned/archived)
+        ".ccPatchArchiveSectionHeader{display:flex;align-items:center;justify-content:space-between;"
+        "width:100%;background:transparent;border:0;border-top:1px solid var(--app-primary-border-color);"
+        "color:var(--app-secondary-foreground);cursor:pointer;padding:4px 10px 4px 8px;"
+        "margin-top:4px;font-size:10.5px;font-weight:600;"
+        "text-align:left;opacity:.65;user-select:none}"
+        ".ccPatchArchiveSectionHeader:hover,.ccPatchArchiveSectionOpen{opacity:1}"
+        ".ccPatchStarSection{border-top:0;margin-top:2px}"
+        ".ccPatchPinSection{margin-top:2px}"
+        ".ccPatchArchiveLabel{flex:1}"
+        ".ccPatchArchiveCount{font-size:10px;font-weight:500;opacity:.8;"
+        "background:var(--app-list-hover-background);border-radius:8px;padding:0 5px;line-height:16px}"
+        # Archived items — slightly dimmed like VS Code
+        ".ccPatchArchivedItem{opacity:.75}"
+        ".ccPatchArchivedItem:hover{opacity:1}"
+        # Filter button + icon
+        ".ccPatchFilterButton{position:relative}"
+        ".ccPatchFilterIcon{display:inline-block;width:14px;height:10px;position:relative;opacity:.9}"
+        ".ccPatchFilterIcon::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;"
+        "background:currentColor;border-radius:1px;box-shadow:0 4px 0 0 currentColor,0 8px 0 0 currentColor}"
+        ".ccPatchFilterButtonActive .ccPatchFilterIcon::after{"
+        "content:'';position:absolute;right:-3px;top:-3px;width:5px;height:5px;"
+        "border-radius:50%;background:var(--vscode-charts-blue,#3b82f6);"
+        "border:1.5px solid var(--app-primary-background)}"
+        ".ccPatchFilterButtonOpen .ccPatchFilterIcon{opacity:1}"
+        # Filter menu dropdown
+        ".claudePatchFilterMenu{position:fixed;z-index:2000;"
+        "background:var(--app-menu-background);border:1px solid var(--app-menu-border);"
+        "border-radius:8px;padding:6px;box-shadow:0 6px 20px #00000055;"
+        "display:flex;flex-direction:column;min-width:200px;max-width:280px;"
+        "font-size:13px;color:var(--app-primary-foreground)}"
+        ".claudePatchFilterGroup{display:flex;flex-direction:column;padding:4px 2px;"
+        "border-bottom:1px solid var(--app-menu-border)}"
         ".claudePatchFilterGroup:last-of-type{border-bottom:0}"
-        ".claudePatchFilterGroupTitle{font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.65;padding:2px 8px 4px}"
-        ".claudePatchFilterOption{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;user-select:none}"
+        ".claudePatchFilterGroupTitle{font-size:11px;text-transform:uppercase;"
+        "letter-spacing:.04em;opacity:.65;padding:2px 8px 4px}"
+        ".claudePatchFilterOption{display:flex;align-items:center;gap:8px;"
+        "padding:5px 8px;border-radius:4px;cursor:pointer;user-select:none}"
         ".claudePatchFilterOption:hover{background:var(--app-list-hover-background)}"
         ".claudePatchFilterOption input{margin:0;accent-color:var(--vscode-charts-blue,#3b82f6)}"
         ".claudePatchFilterFooter{display:flex;justify-content:flex-end;padding:4px 2px 2px}"
-        ".claudePatchFilterFooter button{background:transparent;border:0;color:var(--app-secondary-foreground);font-size:12px;padding:4px 8px;border-radius:4px;cursor:pointer}"
-        ".claudePatchFilterFooter button:hover{background:var(--app-list-hover-background);color:var(--app-primary-foreground)}"
+        ".claudePatchFilterFooter button{background:transparent;border:0;"
+        "color:var(--app-secondary-foreground);font-size:12px;padding:4px 8px;"
+        "border-radius:4px;cursor:pointer}"
+        ".claudePatchFilterFooter button:hover{background:var(--app-list-hover-background);"
+        "color:var(--app-primary-foreground)}"
+        # (toggle icon is now inline SVG — no CSS needed)
     )
-    new_block = CSS_SENTINEL_START + patch_body + CSS_SENTINEL_END
-    # Strip any prior patched block so reapplying always lands the current CSS.
-    start = text.find(CSS_SENTINEL_START)
-    end = text.find(CSS_SENTINEL_END)
-    if start != -1 and end != -1 and end > start:
-        text = text[:start] + text[end + len(CSS_SENTINEL_END) :]
+    css_marker = ".ccPatchHeaderBtn{display:inline-flex;"
+    old_media_hide = (
+        "@media(max-width:900px){"
+        ".claudePatchInlineSessions{flex-basis:0!important;min-width:0!important;"
+        "opacity:0;pointer-events:none}"
+        ".claudePatchResizeHandle{display:none!important}}"
+    )
+    if old_media_hide in text:
+        text = text.replace(old_media_hide, "", 1)
         changed = True
-    # Also strip the v0.0.x / v0.1.x raw-appended blocks (no sentinels).
-    for legacy in _LEGACY_CSS_BLOCKS:
-        if legacy in text:
-            text = text.replace(legacy, "", 1)
-            changed = True
-    if anchor not in text:
-        raise RuntimeError("Could not find Claude CSS anchor")
-    if new_block not in text:
-        text = text.replace(anchor, anchor + new_block, 1)
+    if old in text and css_marker not in text:
+        text = text.replace(old, new, 1)
         changed = True
     if changed:
         write(webview_css, text)
     return changed
-
-
-_LEGACY_CSS_BLOCKS = (
-    # v0.0.x — original spec, before toggle support
-    ".claudePatchMainContent{position:relative;z-index:2;overflow:visible}.overlay_f3sAzg{z-index:10000;background-color:#000000e6}.claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}.claudePatchInlineSessions>div{height:100%}.claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}.claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}.claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}.claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}.claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}@keyframes claudePatchSpin{to{transform:rotate(360deg)}}.claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}.claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}.claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}",
-    # v0.1.x — added toggle, min-width/min-height, extra overlay classes, but no waiting indicator
-    ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}.overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}.claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}.claudePatchInlineSessions>div{height:100%}.claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}.claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}.claudePatchSidebarIcon{display:inline-block;width:14px;height:14px;border:1.5px solid currentColor;border-radius:2px;box-sizing:border-box;position:relative;opacity:.9}.claudePatchSidebarIcon::after{content:'';position:absolute;top:0;bottom:0;right:0;width:5px;background:currentColor;border-radius:0 .5px .5px 0}body.claudePatchSessionsHidden .claudePatchSidebarIcon{opacity:.55}body.claudePatchSessionsHidden .claudePatchSidebarIcon::after{background:transparent}.claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}.claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}.claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}@keyframes claudePatchSpin{to{transform:rotate(360deg)}}.claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}.claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}.claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}",
-)
 
 
 def patch_extension_dir(extension_dir: Path) -> bool:
@@ -333,7 +1574,7 @@ def patch_extension_dir(extension_dir: Path) -> bool:
     webview_js = extension_dir / "webview" / "index.js"
     webview_css = extension_dir / "webview" / "index.css"
     if not webview_js.exists() or not webview_css.exists():
-        raise RuntimeError("Could not find Claude webview index.js/index.css")
+        raise RuntimeError("Could not find Claude webview index.js / index.css")
     log("Patching Claude webview JS")
     changed |= patch_webview_js(webview_js)
     log("Patching Claude webview CSS")
@@ -346,46 +1587,48 @@ def verify_extension_dir(extension_dir: Path) -> None:
     js = read(extension_dir / "webview" / "index.js")
     css = read(extension_dir / "webview" / "index.css")
     checks = {
-        "star helper": "ccPatchStarTitle" in js,
-        "pin helper": "ccPatchPinTitle" in js,
+        "star helper": "ccPatchIsStarred" in js,
+        "pin helper": "ccPatchIsPinned" in js,
+        "archive helper": "ccPatchToggleArchive" in js,
         "context menu": "ccPatchShowMenu" in js and ".claudePatchContextMenu" in css,
         "pin sort": "ccPatchSortSessions" in js,
+        "archive sort": "ccPatchIsArchived(e)" in js,
         "inline sessions": "claudePatchInlineSessions" in js and ".claudePatchInlineSessions" in css,
-        "main content overlay": "claudePatchMainContent" in js
-        and ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}" in css,
-        "modal backdrop": ".overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}"
-        in css,
-        "sidebar toggle": "ccPatchToggleSessions" in js
+        "main content overlay": "claudePatchMainContent" in js and ".claudePatchMainContent" in css,
+        "resize handle": "ccPatchStartResize" in js and ".claudePatchResizeHandle" in css,
+        "stacked row": "ccPatchRowInner" in js and ".ccPatchRowInner" in css,
+        "row actions": "ccPatchRowActions" in js and ".ccPatchRowActions" in css,
+        "status running": ".claudePatchStatusRunning" in css,
+        "pin button": "ccPatchPinBtn" in js and "SVG_PIN" not in js,
+        "archive button": 'title:"Archive"' in js and "ccPatchArchiveBtn" in js,
+        "no rename button": 'title:"Rename session"' not in js,
+        "new session btn": "ccPatchNewSessionBtn" in js and ".ccPatchNewSessionBtn" in css,
+        "double-click rename": "onDoubleClick" in js,
+        "edit mode wrap fix": "ccPatchRowInnerEdit" in js and ".ccPatchRowInnerEdit" in css,
+        "time format": "days ago" in js,
+        "now time": "return`now`" in js,
+        "activity text": "ccPatchActivityText" in js,
+        "archive section": "ccPatchArchiveSectionHeader" in js and ".ccPatchArchiveSectionHeader" in css,
+        "pin section": "ccPatchPinState" in js,
+        "star section": "ccPatchStarState" in js,
+        "filter system": "ccPatchFilterSort" in js and "ccPatchShowFilterMenu" in js,
+        "sidebar header": "ccPatchSidebarHeader" in js and ".ccPatchSidebarHeader" in css,
+        "header btn css": ".ccPatchHeaderBtn" in css,
+        "localStorage states": "ccPatchGetSS" in js and "ccPatchTogglePin" in js,
+        "star hover button": "ccPatchStarBtn" in js and ".ccPatchStarBtn" in css,
+        "search toggle": "ccPatchToggleSearch" in js and ".ccPatchSearchRow" in css,
+        "svg actions": "ccPatchIsPinned(" in js and "polygon" in js,
+        "filter button": "ccPatchShowFilterMenu" in js and ".ccPatchFilterButton" in css,
+        "filter menu css": ".claudePatchFilterMenu" in css,
+        "waiting indicator": "ccPatchIsWaiting" in js and ".claudePatchStatusWaiting" in css,
+        "pane toggle": "ccPatchTogglePane" in js
         and 'ariaLabel:"Toggle session pane"' in js
-        and ".claudePatchSidebarIcon" in css,
-        "sessions hidden state": "body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}"
-        in css,
-        "resize handle": "ccPatchStartResize" in js
-        and ".claudePatchResizeHandle{order:1;position:relative;z-index:0;" in css,
-        "status indicators": "ccPatchSessionIndicator" in js
-        and ".claudePatchStatusRunning" in css
-        and ".claudePatchStatusDone" in css,
-        "waiting indicator": "ccPatchIsWaiting" in js
-        and ".claudePatchStatusWaiting" in css
-        and "@keyframes claudePatchWaitingPulse" in css,
-        "star toggle + dynamic labels": "ccPatchIsStarred" in js
-        and "ccPatchToggleStarTitle" in js
-        and 'ccPatchIsPinned(Z)?"Unpin":"Pin"' in js
-        and 'ccPatchIsStarred(Z)?"Unstar":"Star"' in js,
-        "rewind without file changes": "W=q?.canRewind&&!Q;" in js,
-        "edit actions preserved": 'title:"Rename session"' in js and 'title:"Delete session"' in js,
-        "filter helpers": "ccPatchFilterSort" in js
-        and "ccPatchReadFilters" in js
-        and "ccPatchSessionMatchesFilters" in js,
-        "filter button + css": 'ariaLabel:"Filter sessions"' in js
-        and "ccPatchShowFilterMenu" in js
-        and ".claudePatchFilterMenu{" in css
-        and ".claudePatchFilterButton{" in css,
-        "filter wired into sort sites": "b=ccPatchFilterSort(b)" in js
-        and "localSessions:ccPatchFilterSort(u)" in js
-        and "remoteSessions:ccPatchFilterSort(o)" in js,
-        "filter subscription hook": "ccPatchFilterListeners" in js
-        and "ccPatchFiltersSetTick" in js,
+        and "ccPatchHeaderBtn" in js
+        and 'viewBox:"0 0 20 20"' in js,
+        "history preserved": 'ariaLabel:"Session history"' in js,
+        "sidebar not media-hidden": "@media(max-width:900px)" not in css,
+        "overlay fix": "z-index:10000!important;background-color:#000000e6!important" in css,
+        "row height": "min-height:48px" in css,
     }
     missing = [name for name, ok in checks.items() if not ok]
     if missing:
@@ -395,55 +1638,6 @@ def verify_extension_dir(extension_dir: Path) -> None:
         log("Running JS syntax check")
         subprocess.check_call([node, "--check", str(extension_dir / "webview" / "index.js")])
     log(f"Verification passed ({len(checks)} checks)")
-
-
-_EXTENSION_ID = "anthropic.claude-code"
-
-
-def _vscode_extensions_dirs() -> list[Path]:
-    """Candidate roots where VS Code stores installed extensions."""
-    candidates: list[Path] = []
-    home = Path.home()
-    candidates.append(home / ".vscode" / "extensions")
-    candidates.append(home / ".vscode-insiders" / "extensions")
-    candidates.append(home / ".vscode-server" / "extensions")
-    # Windows tends to redundantly resolve to the same as ~/.vscode/extensions,
-    # but be defensive.
-    appdata = Path(home / "AppData" / "Roaming" / "Code" / "User")
-    if appdata.exists():
-        candidates.append(appdata.parent / "extensions")
-    return [path for path in candidates if path.exists()]
-
-
-def _parse_semver(text: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for chunk in text.split("."):
-        try:
-            parts.append(int(chunk))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
-
-
-def find_installed_extension(extension_id: str = _EXTENSION_ID) -> Path | None:
-    """Find the highest-version installed VS Code extension directory.
-
-    VS Code stores extensions as ``<publisher>.<name>-<version>``. When more
-    than one version is present, VS Code loads the highest. Patching anything
-    else is a no-op as far as the running editor is concerned.
-    """
-    best_path: Path | None = None
-    best_version: tuple[int, ...] = ()
-    prefix = f"{extension_id}-"
-    for root in _vscode_extensions_dirs():
-        for entry in root.iterdir():
-            if not entry.is_dir() or not entry.name.startswith(prefix):
-                continue
-            version = _parse_semver(entry.name[len(prefix) :])
-            if version > best_version:
-                best_version = version
-                best_path = entry
-    return best_path
 
 
 def zip_dir(src: Path, dest: Path) -> None:
@@ -472,7 +1666,7 @@ def main() -> int:
         "-V",
         "--patcher-version",
         action="version",
-        version=f"vscode-claude-code-extension-improvements-patch {__version__}",
+        version=f"vsclaudefix {__version__}",
     )
     args = parser.parse_args()
 
@@ -490,11 +1684,24 @@ def main() -> int:
     else:
         item = marketplace_item_from_target(raw)
         if item is None:
-            raise RuntimeError(f"Target does not exist and is not a Marketplace item or URL: {raw}")
-        target = download_marketplace_vsix(item, Path(args.download_dir).expanduser().resolve(), args.version or None)
+            raise RuntimeError(f"Target does not exist and is not a Marketplace item: {raw}")
+        target = download_marketplace_vsix(
+            item,
+            Path(args.download_dir).expanduser().resolve(),
+            args.version or None,
+        )
 
-    out = Path(args.out).resolve() if args.out else target.with_name(target.stem + ".tasks-patched.vsix")
+    builds_dir = Path(__file__).parent / "builds"
+    builds_dir.mkdir(exist_ok=True)
+    if args.out:
+        out = Path(args.out).resolve()
+    else:
+        n = 1
+        while (builds_dir / f"anthropic-claude-code-patch-{n}.vsix").exists():
+            n += 1
+        out = builds_dir / f"anthropic-claude-code-patch-{n}.vsix"
     log(f"Output VSIX: {out}")
+
     with tempfile.TemporaryDirectory(prefix="claude-vsix-patch-") as temp:
         root = Path(temp) / "vsix"
         log("Extracting VSIX")
@@ -503,6 +1710,7 @@ def main() -> int:
         changed = patch_extension_dir(root / "extension")
         log("Writing patched VSIX")
         zip_dir(root, out)
+
     log(f"Patched VSIX written: {out}")
     log(f"Overall status: {'updated files' if changed else 'already patched'}")
 
@@ -517,11 +1725,7 @@ def main() -> int:
 
 
 def _try_install_vsix(vsix_path: Path) -> bool:
-    """Try to install a patched VSIX via the `code` CLI. Returns True on success.
-
-    Falls back gracefully if `code` is not on PATH or the install fails — the
-    user still has the .vsix on disk and can install it manually.
-    """
+    """Try to install a patched VSIX via the `code` CLI. Returns True on success."""
     code_cli = shutil.which("code") or shutil.which("code.cmd") or shutil.which("code-insiders")
     if code_cli is None:
         log("`code` CLI not found on PATH; skipping auto-install.")
