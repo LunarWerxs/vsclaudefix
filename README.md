@@ -1,6 +1,6 @@
 # VSCode Claude Code Extension Improvement's Patch
 
-> Current version: **v0.2.0**
+> Current version: **v0.2.1**
 
 A post-build patcher for the **Claude Code VS Code extension** that replaces the cramped session-history popover with a persistent, resizable session pane — plus a handful of related ergonomic fixes and status indicators.
 
@@ -10,7 +10,7 @@ This is a community patch, not an official Anthropic project. It edits the insta
 
 - **Persistent right-side session pane** with a draggable divider between chat and sessions.
 - **Header toggle button** (next to "Session history") that hides/shows the session pane. State and the chosen width persist across reloads.
-- **Pin / Star** actions on sessions via right-click context menu. Pinned sessions sort to the top.
+- **Pin / Star** actions on sessions via right-click context menu — both toggle on/off and the menu labels flip to `Unpin` / `Unstar` when the action is already applied. Pinned sessions sort to the top.
 - **Three status indicators on session rows:**
   - **Running** — animated spinner while the session is actively working.
   - **Waiting for your reply** *(new in v0.2.0)* — pulsing amber dot when the session is idle and Claude's last message is waiting on you (e.g. it asked a question or finished a turn).
@@ -109,6 +109,11 @@ Claude Code's source is not public. The webview bundle is the only artifact avai
 See [CLAUDE_EXTENSION_FEEDBACK.md](CLAUDE_EXTENSION_FEEDBACK.md) for the full feature spec sent to the Anthropic team.
 
 ## Changelog
+
+### v0.2.1
+
+- **Star is now toggleable.** Right-clicking a starred session and selecting the menu item removes the star. Previously the action was one-way.
+- **Pin/Star menu labels are dynamic.** The context menu now reads `Unpin` / `Unstar` when the session is already pinned/starred, so it's obvious what the next click will do.
 
 ### v0.2.0
 

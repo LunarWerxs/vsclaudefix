@@ -18,7 +18,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
 MARKETPLACE_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
@@ -76,9 +76,11 @@ def download_marketplace_vsix(item: str, dest_dir: Path, version: str | None = N
 
 
 CLAUDE_HELPER_JS = r"""function ccPatchTitle(e){return(e.summary?.value||`Untitled`).trim()}
-function ccPatchStarTitle(e){let t=ccPatchTitle(e);return t.startsWith(`⭐ `)?t:`⭐ ${t}`}
-function ccPatchPinTitle(e){let t=ccPatchTitle(e),n=t.startsWith(`⭐ `),r=n?t.slice(2).trimStart():t;return r.startsWith(`📌 `)?(n?`⭐ `:``)+r.slice(2).trimStart():(n?`⭐ 📌 `:`📌 `)+r}
+function ccPatchIsStarred(e){return ccPatchTitle(e).startsWith(`⭐ `)}
 function ccPatchIsPinned(e){let t=ccPatchTitle(e);return t.startsWith(`📌 `)||t.startsWith(`⭐ 📌 `)}
+function ccPatchToggleStarTitle(e){let t=ccPatchTitle(e);if(t.startsWith(`⭐ 📌 `))return`📌 ${t.slice(4).trimStart()}`;if(t.startsWith(`⭐ `))return t.slice(2).trimStart();if(t.startsWith(`📌 `))return`⭐ ${t}`;return`⭐ ${t}`}
+function ccPatchStarTitle(e){return ccPatchToggleStarTitle(e)}
+function ccPatchPinTitle(e){let t=ccPatchTitle(e),n=t.startsWith(`⭐ `),r=n?t.slice(2).trimStart():t;return r.startsWith(`📌 `)?(n?`⭐ `:``)+r.slice(2).trimStart():(n?`⭐ 📌 `:`📌 `)+r}
 function ccPatchSortSessions(e,t){return Number(ccPatchIsPinned(t))-Number(ccPatchIsPinned(e))||t.lastModifiedTime.value-e.lastModifiedTime.value}
 function ccPatchSessionId(e){return e.sessionId?.value||e.internalId||ccPatchTitle(e)}
 var ccPatchBusyBySession=new Map,ccPatchDoneSessions=new Set;
@@ -87,7 +89,7 @@ function ccPatchClearDone(e){ccPatchDoneSessions.delete(ccPatchSessionId(e))}
 function ccPatchIsWaiting(e){let t=e.messages?.value;if(!t||!t.length)return!1;let n=t[t.length-1];return n?.type===`assistant`}
 function ccPatchSessionIndicator(e){if(e.busy?.value)return`running`;if(ccPatchIsWaiting(e))return`waiting`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
 function ccPatchCloseMenu(){document.querySelector(`.claudePatchContextMenu`)?.remove()}
-function ccPatchShowMenu(e,t,n,r){ccPatchCloseMenu();let a=document.createElement(`div`);a.className=`claudePatchContextMenu`,a.style.left=`${Math.min(e,window.innerWidth-150)}px`,a.style.top=`${Math.min(t,window.innerHeight-72)}px`;let i=(s,o)=>{let c=document.createElement(`button`),l=!1,d=(u)=>{u.preventDefault(),u.stopPropagation();if(l)return;l=!0,ccPatchCloseMenu(),o()};return c.textContent=s,c.onmousedown=d,c.onclick=d,a.appendChild(c),c};i(`Pin`,n),i(`Star`,r),document.body.appendChild(a);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
+function ccPatchShowMenu(e,t,n,r,a,i){ccPatchCloseMenu();let s=document.createElement(`div`);s.className=`claudePatchContextMenu`,s.style.left=`${Math.min(e,window.innerWidth-150)}px`,s.style.top=`${Math.min(t,window.innerHeight-72)}px`;let o=(c,l)=>{let d=document.createElement(`button`),u=!1,h=(p)=>{p.preventDefault(),p.stopPropagation();if(u)return;u=!0,ccPatchCloseMenu(),l()};return d.textContent=c,d.onmousedown=h,d.onclick=h,s.appendChild(d),d};o(a||`Pin`,n),o(i||`Star`,r),document.body.appendChild(s);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
 function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t||document.body.classList.contains(`claudePatchSessionsHidden`))return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`);try{localStorage.setItem(`claudePatchSessionsWidth`,String(s))}catch(o){}},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
 function ccPatchAreSessionsHidden(){try{return localStorage.getItem(`claudePatchSessionsHidden`)===`1`}catch(e){return!1}}
 function ccPatchApplyVisibility(){let e=ccPatchAreSessionsHidden();document.body.classList.toggle(`claudePatchSessionsHidden`,e);try{let t=parseFloat(localStorage.getItem(`claudePatchSessionsWidth`)||``);if(t>=180&&t<=window.innerWidth*.75)document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${t}px`)}catch(n){}}
@@ -102,7 +104,7 @@ def patch_webview_js(webview_js: Path) -> bool:
     anchor = "var _R0=16,wR0=1000;"
     if anchor not in text:
         raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "function ccPatchIsWaiting(" not in text:
+    if "function ccPatchIsStarred(" not in text:
         # Upgrade path: an older helper block may already be present. Strip it
         # back to the anchor, then re-inject the current helper block.
         helper_start = text.find("function ccPatchTitle(")
@@ -127,9 +129,15 @@ def patch_webview_js(webview_js: Path) -> bool:
         changed = True
 
     old_context = 'return S0.default.createElement("button",{ref:F,className:`${w2.sessionItem} ${J?w2.active:""} ${Y?w2.focused:""}`,onClick:X?void 0:G,onMouseMove:q},'
-    new_context = 'return S0.default.createElement("button",{ref:F,className:`${w2.sessionItem} ${J?w2.active:""} ${Y?w2.focused:""}`,onClick:X?void 0:(M)=>{ccPatchClearDone(Z),I(W5=>W5+1),G(M)},onMouseMove:q,onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchStarTitle(Z)))}},'
+    new_context = 'return S0.default.createElement("button",{ref:F,className:`${w2.sessionItem} ${J?w2.active:""} ${Y?w2.focused:""}`,onClick:X?void 0:(M)=>{ccPatchClearDone(Z),I(W5=>W5+1),G(M)},onMouseMove:q,onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchToggleStarTitle(Z)),ccPatchIsPinned(Z)?"Unpin":"Pin",ccPatchIsStarred(Z)?"Unstar":"Star")}},'
     if old_context in text:
         text = text.replace(old_context, new_context, 1)
+        changed = True
+    # Upgrade path: replace the v0.1.x / v0.2.0 context handler (hardcoded labels, one-way Star) with the v0.2.1 form.
+    legacy_context_handler = 'onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchStarTitle(Z)))}'
+    new_context_handler = 'onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchToggleStarTitle(Z)),ccPatchIsPinned(Z)?"Unpin":"Pin",ccPatchIsStarred(Z)?"Unstar":"Star")}'
+    if legacy_context_handler in text:
+        text = text.replace(legacy_context_handler, new_context_handler, 1)
         changed = True
 
     old_status_var = 'let _=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
@@ -264,6 +272,7 @@ def verify_extension_dir(extension_dir: Path) -> None:
         "resize handle": "ccPatchStartResize" in js and ".claudePatchResizeHandle{order:1;position:relative;z-index:0;" in css,
         "status indicators": "ccPatchSessionIndicator" in js and ".claudePatchStatusRunning" in css and ".claudePatchStatusDone" in css,
         "waiting indicator": "ccPatchIsWaiting" in js and ".claudePatchStatusWaiting" in css and "@keyframes claudePatchWaitingPulse" in css,
+        "star toggle + dynamic labels": "ccPatchIsStarred" in js and "ccPatchToggleStarTitle" in js and 'ccPatchIsPinned(Z)?"Unpin":"Pin"' in js and 'ccPatchIsStarred(Z)?"Unstar":"Star"' in js,
         "rewind without file changes": "W=q?.canRewind&&!Q;" in js,
         "edit actions preserved": 'title:"Rename session"' in js and 'title:"Delete session"' in js,
     }
