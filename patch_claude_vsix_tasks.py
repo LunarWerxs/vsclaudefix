@@ -5,6 +5,7 @@ Post-build patcher for the Claude Code VS Code extension. Adds a persistent
 right-side session pane, pin/star, status indicators (running / done / waiting),
 a header toggle, and modal/layout fixes. See README.md.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,10 +19,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.2.3"
+__version__ = "0.3.1"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
-MARKETPLACE_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
+MARKETPLACE_QUERY_URL = (
+    "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
+)
 LOG_PATH: Path | None = None
 
 
@@ -86,8 +89,8 @@ function ccPatchSessionId(e){return e.sessionId?.value||e.internalId||ccPatchTit
 var ccPatchBusyBySession=new Map,ccPatchDoneSessions=new Set;
 function ccPatchTrackSessionStatus(e,t){let n=ccPatchSessionId(e),r=!!e.busy?.value,a=ccPatchBusyBySession.get(n);a===void 0?ccPatchBusyBySession.set(n,r):(a&&!r&&(ccPatchDoneSessions.add(n),setTimeout(t,0)),ccPatchBusyBySession.set(n,r))}
 function ccPatchClearDone(e){ccPatchDoneSessions.delete(ccPatchSessionId(e))}
-function ccPatchIsWaiting(e){return!!e.pendingInput?.value&&!e.busy?.value}
-function ccPatchSessionIndicator(e,t){if(e.busy?.value)return`running`;if(!t&&ccPatchIsWaiting(e))return`waiting`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
+function ccPatchIsWaiting(e){let t=e.permissionRequests?.value;return!!(t&&t.length>0)}
+function ccPatchSessionIndicator(e,t){if(!t&&ccPatchIsWaiting(e))return`waiting`;if(e.busy?.value)return`running`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
 function ccPatchCloseMenu(){document.querySelector(`.claudePatchContextMenu`)?.remove()}
 function ccPatchShowMenu(e,t,n,r,a,i){ccPatchCloseMenu();let s=document.createElement(`div`);s.className=`claudePatchContextMenu`,s.style.left=`${Math.min(e,window.innerWidth-150)}px`,s.style.top=`${Math.min(t,window.innerHeight-72)}px`;let o=(c,l)=>{let d=document.createElement(`button`),u=!1,h=(p)=>{p.preventDefault(),p.stopPropagation();if(u)return;u=!0,ccPatchCloseMenu(),l()};return d.textContent=c,d.onmousedown=h,d.onclick=h,s.appendChild(d),d};o(a||`Pin`,n),o(i||`Star`,r),document.body.appendChild(s);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
 function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t||document.body.classList.contains(`claudePatchSessionsHidden`))return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`);try{localStorage.setItem(`claudePatchSessionsWidth`,String(s))}catch(o){}},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
@@ -104,7 +107,7 @@ def patch_webview_js(webview_js: Path) -> bool:
     anchor = "var _R0=16,wR0=1000;"
     if anchor not in text:
         raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "!!e.pendingInput?.value&&!e.busy?.value" not in text:
+    if "function ccPatchSessionIndicator(e,t){if(!t&&ccPatchIsWaiting(e))" not in text:
         # Upgrade path: an older helper block may already be present. Strip it
         # back to the anchor, then re-inject the current helper block.
         helper_start = text.find("function ccPatchTitle(")
@@ -116,14 +119,14 @@ def patch_webview_js(webview_js: Path) -> bool:
         text = text.replace(anchor, CLAUDE_HELPER_JS + anchor, 1)
         changed = True
 
-    old_sort = '}):_1,t=S0.useRef(F);'
-    new_sort = '}):_1;b=[...b].sort(ccPatchSortSessions);let t=S0.useRef(F);'
+    old_sort = "}):_1,t=S0.useRef(F);"
+    new_sort = "}):_1;b=[...b].sort(ccPatchSortSessions);let t=S0.useRef(F);"
     if old_sort in text:
         text = text.replace(old_sort, new_sort, 1)
         changed = True
 
-    old_status_hook = 'z6();let j=S0.useRef(null),D=S0.useRef(!0);'
-    new_status_hook = 'z6();let j=S0.useRef(null),D=S0.useRef(!0),[L,I]=S0.useState(0);S0.useEffect(()=>{ccPatchTrackSessionStatus(Z,()=>I(M=>M+1))},[Z,Z.busy?.value]);'
+    old_status_hook = "z6();let j=S0.useRef(null),D=S0.useRef(!0);"
+    new_status_hook = "z6();let j=S0.useRef(null),D=S0.useRef(!0),[L,I]=S0.useState(0);S0.useEffect(()=>{ccPatchTrackSessionStatus(Z,()=>I(M=>M+1))},[Z,Z.busy?.value]);"
     if old_status_hook in text:
         text = text.replace(old_status_hook, new_status_hook, 1)
         changed = True
@@ -134,19 +137,22 @@ def patch_webview_js(webview_js: Path) -> bool:
         text = text.replace(old_context, new_context, 1)
         changed = True
     # Upgrade path: replace the v0.1.x / v0.2.0 context handler (hardcoded labels, one-way Star) with the v0.2.1 form.
-    legacy_context_handler = 'onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchStarTitle(Z)))}'
+    legacy_context_handler = "onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchStarTitle(Z)))}"
     new_context_handler = 'onContextMenu:(M)=>{if(z&&Z.sessionId.value)M.preventDefault(),M.stopPropagation(),ccPatchShowMenu(M.clientX,M.clientY,()=>U(Z,ccPatchPinTitle(Z)),()=>U(Z,ccPatchToggleStarTitle(Z)),ccPatchIsPinned(Z)?"Unpin":"Pin",ccPatchIsStarred(Z)?"Unstar":"Star")}'
     if legacy_context_handler in text:
         text = text.replace(legacy_context_handler, new_context_handler, 1)
         changed = True
 
-    old_status_var = 'let _=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
-    new_status_var = 'let R1=ccPatchSessionIndicator(Z,J),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
+    # Upgrade path: strip the data-cc-state debug attribute if present from earlier dev builds.
+    text = text.replace('"data-cc-state":ccPatchDebugState(Z),', "")
+
+    old_status_var = "let _=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
+    new_status_var = "let R1=ccPatchSessionIndicator(Z,J),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
     if old_status_var in text:
         text = text.replace(old_status_var, new_status_var, 1)
         changed = True
     # Upgrade path: v0.2.0..v0.2.2 passed only Z; bring it to the active-aware 2-arg form.
-    legacy_status_var = 'let R1=ccPatchSessionIndicator(Z),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
+    legacy_status_var = "let R1=ccPatchSessionIndicator(Z),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return"
     if legacy_status_var in text:
         text = text.replace(legacy_status_var, new_status_var, 1)
         changed = True
@@ -163,7 +169,9 @@ def patch_webview_js(webview_js: Path) -> bool:
         text = text.replace(legacy_status_span, new_status_span, 1)
         changed = True
 
-    old_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:h6.content},'
+    old_inline = (
+        'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:h6.content},'
+    )
     new_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:[...u].sort(ccPatchSortSessions),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:[...o].sort(ccPatchSortSessions),remoteConnected:$.remoteConnected.value,remoteReconnecting:$.remoteReconnecting.value,remoteSessionsLoaded:$.remoteSessionsLoaded.value,onReconnectRemote:()=>{$.listRemoteSessions()},activeSession:$.activeSession.value||null,onSessionClick:x,onRenameSession:s,onDeleteSession:_1,onOpenInNewWindow:Z.host!=="jetbrains"?r:void 0,currentCwd:Z.defaultCwd.value,authMethod:Z.authStatus.value?.authMethod,onRefresh:()=>{$.listSessions(),$.listRemoteSessions()},onOpenURL:Z.openURL})),p0.default.createElement("div",{className:"claudePatchResizeHandle",onPointerDown:ccPatchStartResize}),p0.default.createElement("div",{className:`${h6.content} claudePatchMainContent`},'
     if old_inline in text:
         text = text.replace(old_inline, new_inline, 1)
@@ -222,7 +230,7 @@ def patch_webview_css(webview_css: Path) -> bool:
     start = text.find(CSS_SENTINEL_START)
     end = text.find(CSS_SENTINEL_END)
     if start != -1 and end != -1 and end > start:
-        text = text[:start] + text[end + len(CSS_SENTINEL_END):]
+        text = text[:start] + text[end + len(CSS_SENTINEL_END) :]
         changed = True
     # Also strip the v0.0.x / v0.1.x raw-appended blocks (no sentinels).
     for legacy in _LEGACY_CSS_BLOCKS:
@@ -270,14 +278,27 @@ def verify_extension_dir(extension_dir: Path) -> None:
         "context menu": "ccPatchShowMenu" in js and ".claudePatchContextMenu" in css,
         "pin sort": "ccPatchSortSessions" in js,
         "inline sessions": "claudePatchInlineSessions" in js and ".claudePatchInlineSessions" in css,
-        "main content overlay": "claudePatchMainContent" in js and ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}" in css,
-        "modal backdrop": ".overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}" in css,
-        "sidebar toggle": "ccPatchToggleSessions" in js and 'ariaLabel:"Toggle session pane"' in js and ".claudePatchSidebarIcon" in css,
-        "sessions hidden state": "body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}" in css,
-        "resize handle": "ccPatchStartResize" in js and ".claudePatchResizeHandle{order:1;position:relative;z-index:0;" in css,
-        "status indicators": "ccPatchSessionIndicator" in js and ".claudePatchStatusRunning" in css and ".claudePatchStatusDone" in css,
-        "waiting indicator": "ccPatchIsWaiting" in js and ".claudePatchStatusWaiting" in css and "@keyframes claudePatchWaitingPulse" in css,
-        "star toggle + dynamic labels": "ccPatchIsStarred" in js and "ccPatchToggleStarTitle" in js and 'ccPatchIsPinned(Z)?"Unpin":"Pin"' in js and 'ccPatchIsStarred(Z)?"Unstar":"Star"' in js,
+        "main content overlay": "claudePatchMainContent" in js
+        and ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}" in css,
+        "modal backdrop": ".overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}"
+        in css,
+        "sidebar toggle": "ccPatchToggleSessions" in js
+        and 'ariaLabel:"Toggle session pane"' in js
+        and ".claudePatchSidebarIcon" in css,
+        "sessions hidden state": "body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}"
+        in css,
+        "resize handle": "ccPatchStartResize" in js
+        and ".claudePatchResizeHandle{order:1;position:relative;z-index:0;" in css,
+        "status indicators": "ccPatchSessionIndicator" in js
+        and ".claudePatchStatusRunning" in css
+        and ".claudePatchStatusDone" in css,
+        "waiting indicator": "ccPatchIsWaiting" in js
+        and ".claudePatchStatusWaiting" in css
+        and "@keyframes claudePatchWaitingPulse" in css,
+        "star toggle + dynamic labels": "ccPatchIsStarred" in js
+        and "ccPatchToggleStarTitle" in js
+        and 'ccPatchIsPinned(Z)?"Unpin":"Pin"' in js
+        and 'ccPatchIsStarred(Z)?"Unstar":"Star"' in js,
         "rewind without file changes": "W=q?.canRewind&&!Q;" in js,
         "edit actions preserved": 'title:"Rename session"' in js and 'title:"Delete session"' in js,
     }
@@ -289,6 +310,55 @@ def verify_extension_dir(extension_dir: Path) -> None:
         log("Running JS syntax check")
         subprocess.check_call([node, "--check", str(extension_dir / "webview" / "index.js")])
     log(f"Verification passed ({len(checks)} checks)")
+
+
+_EXTENSION_ID = "anthropic.claude-code"
+
+
+def _vscode_extensions_dirs() -> list[Path]:
+    """Candidate roots where VS Code stores installed extensions."""
+    candidates: list[Path] = []
+    home = Path.home()
+    candidates.append(home / ".vscode" / "extensions")
+    candidates.append(home / ".vscode-insiders" / "extensions")
+    candidates.append(home / ".vscode-server" / "extensions")
+    # Windows tends to redundantly resolve to the same as ~/.vscode/extensions,
+    # but be defensive.
+    appdata = Path(home / "AppData" / "Roaming" / "Code" / "User")
+    if appdata.exists():
+        candidates.append(appdata.parent / "extensions")
+    return [path for path in candidates if path.exists()]
+
+
+def _parse_semver(text: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in text.split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def find_installed_extension(extension_id: str = _EXTENSION_ID) -> Path | None:
+    """Find the highest-version installed VS Code extension directory.
+
+    VS Code stores extensions as ``<publisher>.<name>-<version>``. When more
+    than one version is present, VS Code loads the highest. Patching anything
+    else is a no-op as far as the running editor is concerned.
+    """
+    best_path: Path | None = None
+    best_version: tuple[int, ...] = ()
+    prefix = f"{extension_id}-"
+    for root in _vscode_extensions_dirs():
+        for entry in root.iterdir():
+            if not entry.is_dir() or not entry.name.startswith(prefix):
+                continue
+            version = _parse_semver(entry.name[len(prefix) :])
+            if version > best_version:
+                best_version = version
+                best_path = entry
+    return best_path
 
 
 def zip_dir(src: Path, dest: Path) -> None:
@@ -308,12 +378,23 @@ def main() -> int:
     parser.add_argument("--version", default="")
     parser.add_argument("--download-dir", default=".")
     parser.add_argument("--log", default="claude-vsix-patch.log")
-    parser.add_argument("-V", "--patcher-version", action="version", version=f"vscode-claude-code-extension-improvements-patch {__version__}")
+    parser.add_argument(
+        "--vsix-only",
+        action="store_true",
+        help="Skip the auto-install step. Just write the patched .vsix to disk; you install it yourself.",
+    )
+    parser.add_argument(
+        "-V",
+        "--patcher-version",
+        action="version",
+        version=f"vscode-claude-code-extension-improvements-patch {__version__}",
+    )
     args = parser.parse_args()
 
     LOG_PATH = Path(args.log).expanduser().resolve()
     LOG_PATH.write_text("", encoding="utf-8")
     log(f"Starting Claude VSIX patcher v{__version__}")
+
     raw = args.target
     raw_path = Path(raw).expanduser()
     if raw_path.exists() or raw_path.suffix.lower() == ".vsix":
@@ -339,7 +420,36 @@ def main() -> int:
         zip_dir(root, out)
     log(f"Patched VSIX written: {out}")
     log(f"Overall status: {'updated files' if changed else 'already patched'}")
+
+    if not args.vsix_only:
+        installed = _try_install_vsix(out)
+        if installed:
+            log("Reload the VS Code window (Developer: Reload Window) to pick up the new bundle.")
+    else:
+        log("--vsix-only set; skipping auto-install. Install via Extensions -> ... -> Install from VSIX.")
+
     return 0
+
+
+def _try_install_vsix(vsix_path: Path) -> bool:
+    """Try to install a patched VSIX via the `code` CLI. Returns True on success.
+
+    Falls back gracefully if `code` is not on PATH or the install fails — the
+    user still has the .vsix on disk and can install it manually.
+    """
+    code_cli = shutil.which("code") or shutil.which("code.cmd") or shutil.which("code-insiders")
+    if code_cli is None:
+        log("`code` CLI not found on PATH; skipping auto-install.")
+        log(f"Install manually: Extensions -> ... -> Install from VSIX -> {vsix_path}")
+        return False
+    log(f"Installing patched VSIX via {code_cli}")
+    try:
+        subprocess.check_call([code_cli, "--install-extension", str(vsix_path), "--force"])
+    except subprocess.CalledProcessError as exc:
+        log(f"Auto-install failed (exit {exc.returncode}). Install manually from: {vsix_path}")
+        return False
+    log("Patched extension installed.")
+    return True
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ The stock VS Code extension hides every old session behind a cramped popover. Th
 
 Plus the layout and modal bugs that have been driving you up a wall.
 
-> Current release: **v0.2.3** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
+> Current release: **v0.3.1** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
 
 ---
 
@@ -16,11 +16,11 @@ Plus the layout and modal bugs that have been driving you up a wall.
 python patch_claude_vsix_tasks.py
 ```
 
-That downloads the latest Claude Code VSIX from the Marketplace, patches it, and writes `*.tasks-patched.vsix` next to it. Install via **Extensions → "…" → Install from VSIX…** and reload the window.
+That's it. The script downloads the latest Claude Code from the Marketplace, patches it, and installs the patched version via `code --install-extension`. Reload the VS Code window when it's done.
 
-Got the extension installed already and want to skip the round trip? Point the script at the extracted extension directory — see [Power-user usage](#power-user-usage).
+Pass `--vsix-only` if you'd rather inspect the patched `.vsix` before installing it yourself.
 
-**Requires:** Python 3.9+. Node.js is optional (used for a post-patch syntax check).
+**Requires:** Python 3.9+, the `code` CLI on PATH (ships with VS Code). Node.js optional (used for a post-patch syntax check).
 
 ---
 
@@ -36,13 +36,13 @@ Right-click any session. Pin floats it to the top of the list; Star prefixes it 
 
 #### Status dots
 
-| Indicator | Meaning |
-| --- | --- |
-| Spinner | Session is actively working |
-| 🟡 Pulsing amber | Claude is asking you something — a permission prompt or a question |
-| 🔵 Blue dot | Just finished. Clears on click |
+| Indicator       | Meaning                                                            |
+| --------------- | ------------------------------------------------------------------ |
+| 🟡 Pulsing amber | Claude is asking you something — a permission prompt, AskUserQuestion, anything that's actually blocking on you |
+| Spinner         | Session is actively working                                        |
+| 🔵 Blue dot      | Just finished. Clears on click                                     |
 
-Priority is running → waiting → done, so the most actionable state wins. The waiting indicator reads the bundle's real `pendingInput` signal (true only when the backend reports `state === "waiting_input"`), gated on the session being idle and **not** the one you're currently viewing — no point pinging you about the chat you're already in.
+Priority is **waiting → running → done**, so the most-actionable state wins. The waiting indicator reads `session.permissionRequests` — true exactly when a popup is open in that session, gone the moment you answer or dismiss it. Suppressed on the session you're currently viewing (no point flagging the chat you're already in).
 
 #### Quality-of-life fixes
 
@@ -54,36 +54,31 @@ Priority is running → waiting → done, so the most actionable state wins. The
 
 ## Upgrading
 
-Just re-run the script. It detects whichever prior version is in place and replaces it cleanly — CSS is wrapped in sentinel comments and the JS upgrade path strips old helper blocks before re-injecting.
+Re-run the script. The marketplace download always pulls the latest extension, and `--install-extension --force` replaces whatever's currently loaded. Old helper blocks are stripped before the new one is injected.
 
 ## Rollback
 
-Uninstall the patched VSIX and reinstall the stock extension from the Marketplace. If you patched in place (path B below), restore the backups you made first.
+Uninstall the patched VSIX from the VS Code Extensions panel and reinstall the stock extension from the Marketplace.
 
 ## Compatibility
 
-Anchored on Claude Code **2.1.147**. Anthropic ships new bundles regularly and minified identifiers shift — if the patcher errors with *"Could not find Claude session-list helper anchor"*, the bundle has moved. Open an issue with the version.
+Tested against Claude Code **2.1.148**. Anthropic ships new bundles regularly and minified identifiers shift — if the patcher errors with *"Could not find Claude session-list helper anchor"*, the bundle has moved. Open an issue with the extension version and the failing anchor.
 
 ---
 
 ## Power-user usage
 
 ```bash
-# Specific marketplace item / URL / local VSIX
-python patch_claude_vsix_tasks.py anthropic.claude-code
-python patch_claude_vsix_tasks.py ./anthropic.claude-code-2.1.147.vsix
+# Skip auto-install, just write the patched .vsix
+python patch_claude_vsix_tasks.py --vsix-only
+
+# Patch a specific local .vsix instead of downloading
+python patch_claude_vsix_tasks.py ./anthropic.claude-code-2.1.148.vsix
 
 # Custom output path
 python patch_claude_vsix_tasks.py --out ./claude-code.patched.vsix
 
-# Patch the installed extension in place (Windows path shown)
-python -c "import importlib.util, pathlib; \
-spec = importlib.util.spec_from_file_location('p', 'patch_claude_vsix_tasks.py'); \
-m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); \
-m.LOG_PATH = pathlib.Path('claude-vsix-patch.log'); m.LOG_PATH.write_text(''); \
-m.patch_extension_dir(pathlib.Path(r'%USERPROFILE%\.vscode\extensions\anthropic.claude-code-2.1.147'))"
-
-# Version
+# Print version
 python patch_claude_vsix_tasks.py --patcher-version
 ```
 
@@ -93,13 +88,11 @@ The full feature spec sent to the Anthropic team lives in [CLAUDE_EXTENSION_FEED
 
 ## Changelog
 
-**v0.2.3** — Waiting indicator now gated on `!busy` and on the session not being the active one. No more amber pulsing on the chat you're currently typing in.
+**v0.3.1** — Waiting indicator now reads `session.permissionRequests` (the array backing the popup itself) instead of `pendingInput`, which could latch true after a click and never clear. Priority reordered to `waiting → running → done` so the amber dot wins when a popup is open (otherwise the spinner stole the slot while Claude was paused mid-tool-use). Removed `ccPatchDebugState` dev helper that was leaking into release builds.
 
-**v0.2.2** — Waiting indicator now reads the real `pendingInput` signal instead of guessing from message history. Amber dot lights up when Claude actually needs your reply, not just because its message was last.
+**v0.3.0** — Default flow is now download-latest-from-Marketplace → patch → auto-install via `code --install-extension --force`. No more "I patched the wrong installed version" footgun (VS Code can have multiple versions of an extension side-by-side and only loads the highest). Pass `--vsix-only` to opt out of auto-install.
 
-**v0.2.1** — Star is now a toggle. Pin/Star menu labels flip to `Unpin` / `Unstar` when applied.
-
-**v0.2.0** — Waiting indicator. Header show/hide toggle (state + width persisted). Flex layout hardened. Modal z-index hardened. Idempotent re-application. `--patcher-version` flag.
+**v0.2.0–v0.2.3** — Iteration on the waiting indicator: started with a brittle "last message was from assistant" heuristic, moved to `pendingInput`, finally settled on `permissionRequests` in v0.3.1 above. Toggleable Star, dynamic Unpin/Unstar labels, hardened modal/flex layout, header show/hide toggle.
 
 **v0.1.0** — First release: persistent right-side session pane, draggable divider, pin/star context menu, running spinner, done dot, rewind-without-file-changes fix.
 
