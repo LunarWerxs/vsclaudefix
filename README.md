@@ -6,7 +6,7 @@ The stock VS Code extension hides every old session behind a cramped popover. Th
 
 Plus the layout and modal bugs that have been driving you up a wall.
 
-> Current release: **v0.3.1** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
+> Current release: **v0.4.0** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
 
 ---
 
@@ -33,6 +33,15 @@ A persistent session pane on the right of the chat, with a draggable divider. Ne
 #### Pin / Star — actually toggleable
 
 Right-click any session. Pin floats it to the top of the list; Star prefixes it with ⭐. Both toggle on/off, and the menu labels flip to `Unpin` / `Unstar` so it's obvious what the next click does. Existing rename and delete still work exactly as they did.
+
+#### Filter sessions
+
+New filter button to the left of the sidebar-collapse toggle. Multi-select flyout with two groups:
+
+- **Type**: 📌 Pinned, ⭐ Starred, Running, Waiting
+- **Age**: Last 1 hour, 24 hours, 7 days, 30 days
+
+Empty selection = show everything. Within a group, choices OR. Across groups, they AND (so "Pinned ∩ Last 24h" works). Selections persist in `localStorage` and the inline list re-renders live as you toggle. A small blue dot on the button signals when any filter is active; "Clear all" wipes it.
 
 #### Status dots
 
@@ -87,6 +96,8 @@ The full feature spec sent to the Anthropic team lives in [CLAUDE_EXTENSION_FEED
 ---
 
 ## Changelog
+
+**v0.4.0** — Filter button in the header. Multi-select flyout: Type (Pinned / Starred / Running / Waiting) × Age (1h / 24h / 7d / 30d). Filters apply to both the inline session pane and the search popup. Active state persists in `localStorage`; the inline list subscribes to filter changes via a header-component effect so toggles re-render immediately. Helper-block freshness sentinel bumped (`ccPatchFilterSort`) so older patched installs auto-upgrade on re-run.
 
 **v0.3.1** — Waiting indicator now reads `session.permissionRequests` (the array backing the popup itself) instead of `pendingInput`, which could latch true after a click and never clear. Priority reordered to `waiting → running → done` so the amber dot wins when a popup is open (otherwise the spinner stole the slot while Claude was paused mid-tool-use). Removed `ccPatchDebugState` dev helper that was leaking into release builds.
 

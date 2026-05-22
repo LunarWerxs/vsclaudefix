@@ -19,7 +19,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
 MARKETPLACE_QUERY_URL = (
@@ -97,6 +97,16 @@ function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentEl
 function ccPatchAreSessionsHidden(){try{return localStorage.getItem(`claudePatchSessionsHidden`)===`1`}catch(e){return!1}}
 function ccPatchApplyVisibility(){let e=ccPatchAreSessionsHidden();document.body.classList.toggle(`claudePatchSessionsHidden`,e);try{let t=parseFloat(localStorage.getItem(`claudePatchSessionsWidth`)||``);if(t>=180&&t<=window.innerWidth*.75)document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${t}px`)}catch(n){}}
 function ccPatchToggleSessions(){let e=!ccPatchAreSessionsHidden();try{localStorage.setItem(`claudePatchSessionsHidden`,e?`1`:`0`)}catch(t){}document.body.classList.toggle(`claudePatchSessionsHidden`,e)}
+var ccPatchFilterListeners=new Set;
+function ccPatchAgeMsMap(){return{"1h":36e5,"24h":864e5,"7d":6048e5,"30d":2592e6}}
+function ccPatchDefaultFilters(){return{types:[],ages:[]}}
+function ccPatchReadFilters(){try{let e=JSON.parse(localStorage.getItem(`claudePatchFilters`)||`null`);if(e&&typeof e===`object`)return{types:Array.isArray(e.types)?e.types.slice():[],ages:Array.isArray(e.ages)?e.ages.slice():[]}}catch(t){}return ccPatchDefaultFilters()}
+function ccPatchWriteFilters(e){try{localStorage.setItem(`claudePatchFilters`,JSON.stringify(e))}catch(t){}ccPatchFilterListeners.forEach((n)=>{try{n()}catch(r){}})}
+function ccPatchFiltersActive(){let e=ccPatchReadFilters();return e.types.length+e.ages.length}
+function ccPatchSessionMatchesFilters(e,t){if(!t)t=ccPatchReadFilters();if(t.types.length){let n=!1;for(let r of t.types){if(r===`pinned`&&ccPatchIsPinned(e))n=!0;else if(r===`starred`&&ccPatchIsStarred(e))n=!0;else if(r===`running`&&e.busy?.value)n=!0;else if(r===`waiting`&&ccPatchIsWaiting(e))n=!0;if(n)break}if(!n)return!1}if(t.ages.length){let n=ccPatchAgeMsMap(),r=0;for(let a of t.ages){let i=n[a]||0;if(i>r)r=i}if(r>0){let a=e.lastModifiedTime?.value;if(typeof a!==`number`||Date.now()-a>r)return!1}}return!0}
+function ccPatchFilterSort(e){let t=ccPatchReadFilters(),n=t.types.length||t.ages.length?e.filter((r)=>ccPatchSessionMatchesFilters(r,t)):[...e];return n.sort(ccPatchSortSessions)}
+function ccPatchCloseFilterMenu(){document.querySelector(`.claudePatchFilterMenu`)?.remove();document.querySelector(`.claudePatchFilterButton.claudePatchFilterButtonOpen`)?.classList.remove(`claudePatchFilterButtonOpen`)}
+function ccPatchShowFilterMenu(e){ccPatchCloseFilterMenu();let t=e.currentTarget;if(!t)return;t.classList.add(`claudePatchFilterButtonOpen`);let n=t.getBoundingClientRect(),r=document.createElement(`div`);r.className=`claudePatchFilterMenu`,r.style.top=`${Math.round(n.bottom+4)}px`;let a=Math.round(n.left);r.style.left=`${Math.min(a,window.innerWidth-260)}px`;let i=ccPatchReadFilters(),s=(g,b)=>{let m=document.createElement(`div`);m.className=`claudePatchFilterGroup`;let f=document.createElement(`div`);f.className=`claudePatchFilterGroupTitle`,f.textContent=g,m.appendChild(f);for(let[v,w]of b){let y=document.createElement(`label`);y.className=`claudePatchFilterOption`;let k=document.createElement(`input`);k.type=`checkbox`;let A=g===`Type`?`types`:`ages`;k.checked=i[A].includes(v),k.onchange=()=>{let z=ccPatchReadFilters();if(k.checked){if(!z[A].includes(v))z[A].push(v)}else z[A]=z[A].filter((q)=>q!==v);ccPatchWriteFilters(z),i=z};let _=document.createElement(`span`);_.textContent=w,y.appendChild(k),y.appendChild(_),m.appendChild(y)}r.appendChild(m)};s(`Type`,[[`pinned`,`📌 Pinned`],[`starred`,`⭐ Starred`],[`running`,`Running`],[`waiting`,`Waiting`]]),s(`Age`,[[`1h`,`Last 1 hour`],[`24h`,`Last 24 hours`],[`7d`,`Last 7 days`],[`30d`,`Last 30 days`]]);let o=document.createElement(`div`);o.className=`claudePatchFilterFooter`;let c=document.createElement(`button`);c.textContent=`Clear all`,c.onclick=(g)=>{g.preventDefault(),g.stopPropagation(),ccPatchWriteFilters(ccPatchDefaultFilters()),ccPatchCloseFilterMenu()},o.appendChild(c),r.appendChild(o),document.body.appendChild(r);let l=(g)=>{if(!r.contains(g.target)&&!t.contains(g.target))ccPatchCloseFilterMenu(),document.removeEventListener(`mousedown`,l,!0)};setTimeout(()=>document.addEventListener(`mousedown`,l,!0),0)}
 if(typeof document!==`undefined`){if(document.readyState===`loading`)document.addEventListener(`DOMContentLoaded`,ccPatchApplyVisibility);else ccPatchApplyVisibility()}
 """
 
@@ -107,9 +117,11 @@ def patch_webview_js(webview_js: Path) -> bool:
     anchor = "var _R0=16,wR0=1000;"
     if anchor not in text:
         raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "function ccPatchSessionIndicator(e,t){if(!t&&ccPatchIsWaiting(e))" not in text:
+    if "function ccPatchFilterSort(" not in text:
         # Upgrade path: an older helper block may already be present. Strip it
-        # back to the anchor, then re-inject the current helper block.
+        # back to the anchor, then re-inject the current helper block. The
+        # freshness marker bumps with each helper-block revision so older
+        # patched installs always get re-stamped to the current version.
         helper_start = text.find("function ccPatchTitle(")
         if helper_start != -1:
             anchor_pos = text.find(anchor, helper_start)
@@ -120,9 +132,14 @@ def patch_webview_js(webview_js: Path) -> bool:
         changed = True
 
     old_sort = "}):_1,t=S0.useRef(F);"
-    new_sort = "}):_1;b=[...b].sort(ccPatchSortSessions);let t=S0.useRef(F);"
+    new_sort = "}):_1;{let[T1,K1]=S0.useState(0);S0.useEffect(()=>{let M1=()=>K1((q1)=>q1+1);ccPatchFilterListeners.add(M1);return()=>{ccPatchFilterListeners.delete(M1)}},[])}b=ccPatchFilterSort(b);let t=S0.useRef(F);"
     if old_sort in text:
         text = text.replace(old_sort, new_sort, 1)
+        changed = True
+    # Upgrade path: v0.3.x sorted without filtering — promote to combined filter+sort.
+    legacy_sort_only = "}):_1;b=[...b].sort(ccPatchSortSessions);let t=S0.useRef(F);"
+    if legacy_sort_only in text:
+        text = text.replace(legacy_sort_only, new_sort, 1)
         changed = True
 
     old_status_hook = "z6();let j=S0.useRef(null),D=S0.useRef(!0);"
@@ -172,9 +189,15 @@ def patch_webview_js(webview_js: Path) -> bool:
     old_inline = (
         'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:h6.content},'
     )
-    new_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:[...u].sort(ccPatchSortSessions),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:[...o].sort(ccPatchSortSessions),remoteConnected:$.remoteConnected.value,remoteReconnecting:$.remoteReconnecting.value,remoteSessionsLoaded:$.remoteSessionsLoaded.value,onReconnectRemote:()=>{$.listRemoteSessions()},activeSession:$.activeSession.value||null,onSessionClick:x,onRenameSession:s,onDeleteSession:_1,onOpenInNewWindow:Z.host!=="jetbrains"?r:void 0,currentCwd:Z.defaultCwd.value,authMethod:Z.authStatus.value?.authMethod,onRefresh:()=>{$.listSessions(),$.listRemoteSessions()},onOpenURL:Z.openURL})),p0.default.createElement("div",{className:"claudePatchResizeHandle",onPointerDown:ccPatchStartResize}),p0.default.createElement("div",{className:`${h6.content} claudePatchMainContent`},'
+    new_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:ccPatchFilterSort(u),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:ccPatchFilterSort(o),remoteConnected:$.remoteConnected.value,remoteReconnecting:$.remoteReconnecting.value,remoteSessionsLoaded:$.remoteSessionsLoaded.value,onReconnectRemote:()=>{$.listRemoteSessions()},activeSession:$.activeSession.value||null,onSessionClick:x,onRenameSession:s,onDeleteSession:_1,onOpenInNewWindow:Z.host!=="jetbrains"?r:void 0,currentCwd:Z.defaultCwd.value,authMethod:Z.authStatus.value?.authMethod,onRefresh:()=>{$.listSessions(),$.listRemoteSessions()},onOpenURL:Z.openURL})),p0.default.createElement("div",{className:"claudePatchResizeHandle",onPointerDown:ccPatchStartResize}),p0.default.createElement("div",{className:`${h6.content} claudePatchMainContent`},'
     if old_inline in text:
         text = text.replace(old_inline, new_inline, 1)
+        changed = True
+    # Upgrade path: v0.3.x used .sort() inline without filtering.
+    legacy_inline_sort = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:[...u].sort(ccPatchSortSessions),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:[...o].sort(ccPatchSortSessions),'
+    new_inline_sort_prefix = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:"claudePatchInlineSessions"},p0.default.createElement(Rs,{localSessions:ccPatchFilterSort(u),localSessionsLoaded:$.localSessionsLoaded.value,remoteSessions:ccPatchFilterSort(o),'
+    if legacy_inline_sort in text:
+        text = text.replace(legacy_inline_sort, new_inline_sort_prefix, 1)
         changed = True
 
     old_rewind = "let B=q?.filesChanged&&q.filesChanged.length>0,W=q?.canRewind&&!Q&&(B||J);"
@@ -188,6 +211,41 @@ def patch_webview_js(webview_js: Path) -> bool:
     new_history_btn = toggle_btn + "," + old_history_btn
     if old_history_btn in text and toggle_btn not in text:
         text = text.replace(old_history_btn, new_history_btn, 1)
+        changed = True
+
+    # Filter button: sits to the LEFT of the toggle (sidebar collapse) button. Renders a
+    # multi-select flyout (Type/Age groups) and re-renders the session lists when filters
+    # change. Active-filter dot is driven by a CSS class set on the button at render time.
+    filter_btn = (
+        'p0.default.createElement(QQ,{ariaLabel:"Filter sessions",iconSize:20,'
+        'className:ccPatchFiltersActive()?"claudePatchFilterButton claudePatchFilterButtonActive":"claudePatchFilterButton",'
+        'onClick:ccPatchShowFilterMenu},'
+        'p0.default.createElement("span",{className:"claudePatchFilterIcon","aria-hidden":"true"}))'
+    )
+    new_with_filter = filter_btn + "," + toggle_btn
+    if toggle_btn in text and filter_btn not in text:
+        text = text.replace(toggle_btn, new_with_filter, 1)
+        changed = True
+
+    # Subscribe the header component to filter changes so toggling filter checkboxes
+    # re-renders both the filter-button active state and the inline session list.
+    # The original code is one big comma-sequence expression, so we splice in a
+    # useState (for the tick) and a useEffect (to subscribe) as further expressions
+    # in the same sequence — no statement-level reshuffling.
+    # The injection point sits inside one big `let P=...,A=...,y=p0.useCallback(...)`
+    # declarator list. Every comma-separated item MUST be `binding = init`, so the
+    # subscription useEffect has to be assigned to a throwaway binding rather than
+    # called bare.
+    filter_hook_anchor = "[N,E]=p0.useState(null),y=p0.useCallback((b)=>{setTimeout(()=>{let t=gn1(b.milestoneId)"
+    filter_hook_inject = (
+        "[N,E]=p0.useState(null),"
+        "[ccPatchFiltersTick,ccPatchFiltersSetTick]=p0.useState(0),"
+        "ccPatchFiltersEffect=p0.useEffect(()=>{let ccPatchFL=()=>ccPatchFiltersSetTick((ccPatchFTV)=>ccPatchFTV+1);"
+        "ccPatchFilterListeners.add(ccPatchFL);return()=>{ccPatchFilterListeners.delete(ccPatchFL)}},[]),"
+        "y=p0.useCallback((b)=>{setTimeout(()=>{let t=gn1(b.milestoneId)"
+    )
+    if filter_hook_anchor in text and "ccPatchFiltersTick" not in text:
+        text = text.replace(filter_hook_anchor, filter_hook_inject, 1)
         changed = True
 
     if changed:
@@ -224,6 +282,21 @@ def patch_webview_css(webview_css: Path) -> bool:
         ".claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}"
         ".claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}"
         ".claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}"
+        ".claudePatchFilterButton{position:relative}"
+        ".claudePatchFilterIcon{display:inline-block;width:14px;height:10px;position:relative;opacity:.9}"
+        ".claudePatchFilterIcon::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:currentColor;border-radius:1px;box-shadow:0 4px 0 0 currentColor,0 8px 0 0 currentColor}"
+        ".claudePatchFilterButtonActive .claudePatchFilterIcon::after{content:'';position:absolute;right:-3px;top:-3px;width:6px;height:6px;border-radius:50%;background:var(--vscode-charts-blue,#3b82f6);border:1.5px solid var(--app-primary-background)}"
+        ".claudePatchFilterButtonOpen .claudePatchFilterIcon{opacity:1}"
+        ".claudePatchFilterMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:8px;padding:6px;box-shadow:0 6px 20px #00000055;display:flex;flex-direction:column;min-width:200px;max-width:280px;font-size:13px;color:var(--app-primary-foreground)}"
+        ".claudePatchFilterGroup{display:flex;flex-direction:column;padding:4px 2px;border-bottom:1px solid var(--app-menu-border)}"
+        ".claudePatchFilterGroup:last-of-type{border-bottom:0}"
+        ".claudePatchFilterGroupTitle{font-size:11px;text-transform:uppercase;letter-spacing:.04em;opacity:.65;padding:2px 8px 4px}"
+        ".claudePatchFilterOption{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;user-select:none}"
+        ".claudePatchFilterOption:hover{background:var(--app-list-hover-background)}"
+        ".claudePatchFilterOption input{margin:0;accent-color:var(--vscode-charts-blue,#3b82f6)}"
+        ".claudePatchFilterFooter{display:flex;justify-content:flex-end;padding:4px 2px 2px}"
+        ".claudePatchFilterFooter button{background:transparent;border:0;color:var(--app-secondary-foreground);font-size:12px;padding:4px 8px;border-radius:4px;cursor:pointer}"
+        ".claudePatchFilterFooter button:hover{background:var(--app-list-hover-background);color:var(--app-primary-foreground)}"
     )
     new_block = CSS_SENTINEL_START + patch_body + CSS_SENTINEL_END
     # Strip any prior patched block so reapplying always lands the current CSS.
@@ -301,6 +374,18 @@ def verify_extension_dir(extension_dir: Path) -> None:
         and 'ccPatchIsStarred(Z)?"Unstar":"Star"' in js,
         "rewind without file changes": "W=q?.canRewind&&!Q;" in js,
         "edit actions preserved": 'title:"Rename session"' in js and 'title:"Delete session"' in js,
+        "filter helpers": "ccPatchFilterSort" in js
+        and "ccPatchReadFilters" in js
+        and "ccPatchSessionMatchesFilters" in js,
+        "filter button + css": 'ariaLabel:"Filter sessions"' in js
+        and "ccPatchShowFilterMenu" in js
+        and ".claudePatchFilterMenu{" in css
+        and ".claudePatchFilterButton{" in css,
+        "filter wired into sort sites": "b=ccPatchFilterSort(b)" in js
+        and "localSessions:ccPatchFilterSort(u)" in js
+        and "remoteSessions:ccPatchFilterSort(o)" in js,
+        "filter subscription hook": "ccPatchFilterListeners" in js
+        and "ccPatchFiltersSetTick" in js,
     }
     missing = [name for name, ok in checks.items() if not ok]
     if missing:
