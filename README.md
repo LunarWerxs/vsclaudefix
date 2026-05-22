@@ -6,7 +6,7 @@ The stock VS Code extension hides every old session behind a cramped popover. Th
 
 Plus the layout and modal bugs that have been driving you up a wall.
 
-> Current release: **v0.4.1** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
+> Current release: **v0.4.2** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
 
 ---
 
@@ -100,6 +100,8 @@ The full feature spec sent to the Anthropic team lives in [CLAUDE_EXTENSION_FEED
 ---
 
 ## Changelog
+
+**v0.4.2** — Adds a collapsible `Sessions` section above the normal active session list, with persisted open/closed state, so the main list matches the pinned/starred/archived section behavior.
 
 **v0.4.1** — Hardens the dynamic Claude patcher for newer bundles, restores the release ergonomics that drifted during the rewrite (`--patcher-version`, `--vsix-only`, and auto-install), refreshes the README, and verifies against Claude Code 2.1.148.
 

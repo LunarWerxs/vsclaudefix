@@ -36,7 +36,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # Pattern fragment for a minified JS identifier (e.g. `e`, `Nee`, `_Ye`).
 # The Claude webview is minified with single/short letter identifiers that
@@ -825,6 +825,7 @@ def patch_webview_js(webview_js: Path) -> bool:
         f"let [ccPatchArchState,ccPatchSetArchState]={S0}.useState(()=>localStorage.getItem('ccPatchArchiveOpen')==='true');"
         f"let [ccPatchPinState,ccPatchSetPinState]={S0}.useState(()=>localStorage.getItem('ccPatchPinOpen')!=='false');"
         f"let [ccPatchStarState,ccPatchSetStarState]={S0}.useState(()=>localStorage.getItem('ccPatchStarOpen')!=='false');"
+        f"let [ccPatchSessState,ccPatchSetSessState]={S0}.useState(()=>localStorage.getItem('ccPatchSessionsOpen')!=='false');"
         f"{{let[ccPFT,ccPFS]={S0}.useState(0);"
         f"{S0}.useEffect(()=>{{let M=()=>ccPFS((v)=>v+1);ccPatchFilterListeners.add(M);return()=>ccPatchFilterListeners.delete(M)}},[])}}"
         f"let {t_outer}={S0}.useRef({F_outer});"
@@ -1279,8 +1280,22 @@ def patch_webview_js(webview_js: Path) -> bool:
         + ");}"
         f"ccPin.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
         f"if(ccPatchPinState)items.push(" + or0_row + ")});"
+        # ── SESSIONS section (unpinned/unstarred/unarchived) ─────────────────
+        # Always shown so users have a stable "Sessions" header above the main
+        # list — even when no pins/stars/archives exist.
+        "items.push("
+        + hdr(
+            '"__sess_hdr__"',
+            '"ccPatchArchiveSectionHeader ccPatchSessionsSection"',
+            "ccPatchSessState",
+            "ccPatchSetSessState",
+            '"ccPatchSessionsOpen"',
+            '"Sessions"',
+            "ccAct.length",
+        )
+        + ");"
         f"ccAct.forEach(function({g1}){{var {o1}=idx++,{h5}={o1}==={w_var},{k2}={p_var}==={g1}.sessionId.value;"
-        f"items.push(" + or0_row + ")});"
+        f"if(ccPatchSessState)items.push(" + or0_row + ")});"
         "if(ccArch.length>0){items.push("
         + hdr(
             '"__arch_hdr__"',
@@ -1512,6 +1527,7 @@ def patch_webview_css(webview_css: Path) -> bool:
         ".ccPatchArchiveSectionHeader:hover,.ccPatchArchiveSectionOpen{opacity:1}"
         ".ccPatchStarSection{border-top:0;margin-top:2px}"
         ".ccPatchPinSection{margin-top:2px}"
+        ".ccPatchSessionsSection{margin-top:2px}"
         ".ccPatchArchiveLabel{flex:1}"
         ".ccPatchArchiveCount{font-size:10px;font-weight:500;opacity:.8;"
         "background:var(--app-list-hover-background);border-radius:8px;padding:0 5px;line-height:16px}"
