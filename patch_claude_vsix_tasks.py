@@ -18,7 +18,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
 MARKETPLACE_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
@@ -86,8 +86,8 @@ function ccPatchSessionId(e){return e.sessionId?.value||e.internalId||ccPatchTit
 var ccPatchBusyBySession=new Map,ccPatchDoneSessions=new Set;
 function ccPatchTrackSessionStatus(e,t){let n=ccPatchSessionId(e),r=!!e.busy?.value,a=ccPatchBusyBySession.get(n);a===void 0?ccPatchBusyBySession.set(n,r):(a&&!r&&(ccPatchDoneSessions.add(n),setTimeout(t,0)),ccPatchBusyBySession.set(n,r))}
 function ccPatchClearDone(e){ccPatchDoneSessions.delete(ccPatchSessionId(e))}
-function ccPatchIsWaiting(e){return!!e.pendingInput?.value}
-function ccPatchSessionIndicator(e){if(e.busy?.value)return`running`;if(ccPatchIsWaiting(e))return`waiting`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
+function ccPatchIsWaiting(e){return!!e.pendingInput?.value&&!e.busy?.value}
+function ccPatchSessionIndicator(e,t){if(e.busy?.value)return`running`;if(!t&&ccPatchIsWaiting(e))return`waiting`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
 function ccPatchCloseMenu(){document.querySelector(`.claudePatchContextMenu`)?.remove()}
 function ccPatchShowMenu(e,t,n,r,a,i){ccPatchCloseMenu();let s=document.createElement(`div`);s.className=`claudePatchContextMenu`,s.style.left=`${Math.min(e,window.innerWidth-150)}px`,s.style.top=`${Math.min(t,window.innerHeight-72)}px`;let o=(c,l)=>{let d=document.createElement(`button`),u=!1,h=(p)=>{p.preventDefault(),p.stopPropagation();if(u)return;u=!0,ccPatchCloseMenu(),l()};return d.textContent=c,d.onmousedown=h,d.onclick=h,s.appendChild(d),d};o(a||`Pin`,n),o(i||`Star`,r),document.body.appendChild(s);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
 function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t||document.body.classList.contains(`claudePatchSessionsHidden`))return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`);try{localStorage.setItem(`claudePatchSessionsWidth`,String(s))}catch(o){}},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
@@ -104,7 +104,7 @@ def patch_webview_js(webview_js: Path) -> bool:
     anchor = "var _R0=16,wR0=1000;"
     if anchor not in text:
         raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "e.pendingInput?.value" not in text:
+    if "!!e.pendingInput?.value&&!e.busy?.value" not in text:
         # Upgrade path: an older helper block may already be present. Strip it
         # back to the anchor, then re-inject the current helper block.
         helper_start = text.find("function ccPatchTitle(")
@@ -141,9 +141,14 @@ def patch_webview_js(webview_js: Path) -> bool:
         changed = True
 
     old_status_var = 'let _=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
-    new_status_var = 'let R1=ccPatchSessionIndicator(Z),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
+    new_status_var = 'let R1=ccPatchSessionIndicator(Z,J),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
     if old_status_var in text:
         text = text.replace(old_status_var, new_status_var, 1)
+        changed = True
+    # Upgrade path: v0.2.0..v0.2.2 passed only Z; bring it to the active-aware 2-arg form.
+    legacy_status_var = 'let R1=ccPatchSessionIndicator(Z),_=J&&!Z.summary.value&&!Z.messages.value.length&&!Z.teleportedMessageCount.value;return'
+    if legacy_status_var in text:
+        text = text.replace(legacy_status_var, new_status_var, 1)
         changed = True
 
     old_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'

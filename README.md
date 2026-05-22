@@ -6,7 +6,7 @@ The stock VS Code extension hides every old session behind a cramped popover. Th
 
 Plus the layout and modal bugs that have been driving you up a wall.
 
-> Current release: **v0.2.2** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
+> Current release: **v0.2.3** · sister project: [vscodexfix](https://github.com/LunarWerxs/vscodexfix) for the OpenAI Codex extension.
 
 ---
 
@@ -42,7 +42,7 @@ Right-click any session. Pin floats it to the top of the list; Star prefixes it 
 | 🟡 Pulsing amber | Claude is asking you something — a permission prompt or a question |
 | 🔵 Blue dot | Just finished. Clears on click |
 
-Priority is running → waiting → done, so the most actionable state wins. The waiting indicator reads the bundle's real `pendingInput` signal (true only when the backend reports `state === "waiting_input"`), so it lights up when Claude actually needs your reply — not just because the last message happened to be from Claude.
+Priority is running → waiting → done, so the most actionable state wins. The waiting indicator reads the bundle's real `pendingInput` signal (true only when the backend reports `state === "waiting_input"`), gated on the session being idle and **not** the one you're currently viewing — no point pinging you about the chat you're already in.
 
 #### Quality-of-life fixes
 
@@ -92,6 +92,8 @@ The full feature spec sent to the Anthropic team lives in [CLAUDE_EXTENSION_FEED
 ---
 
 ## Changelog
+
+**v0.2.3** — Waiting indicator now gated on `!busy` and on the session not being the active one. No more amber pulsing on the chat you're currently typing in.
 
 **v0.2.2** — Waiting indicator now reads the real `pendingInput` signal instead of guessing from message history. Amber dot lights up when Claude actually needs your reply, not just because its message was last.
 
