@@ -6,6 +6,8 @@ A post-build patcher for the **Claude Code VS Code extension** that replaces the
 
 This is a community patch, not an official Anthropic project. It edits the installed extension's bundled `webview/index.js` and `webview/index.css` in place (or a downloaded `.vsix`).
 
+> **Sister project:** [vscodexfix](https://github.com/LunarWerxs/vscodexfix) — the same idea for the **OpenAI ChatGPT / Codex** VS Code extension (right-click rename / pin / star, expanded task list, workspace grouping, sticky composer).
+
 ## What it does
 
 - **Persistent right-side session pane** with a draggable divider between chat and sessions.
