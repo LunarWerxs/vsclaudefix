@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+"""VSCode Claude Code Extension Improvement's Patch.
+
+Post-build patcher for the Claude Code VS Code extension. Adds a persistent
+right-side session pane, pin/star, status indicators (running / done / waiting),
+a header toggle, and modal/layout fixes. See README.md.
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +17,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
+
+__version__ = "0.2.0"
 
 DEFAULT_MARKETPLACE_ITEM = "anthropic.claude-code"
 MARKETPLACE_QUERY_URL = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery?api-version=7.2-preview.1"
@@ -76,7 +84,8 @@ function ccPatchSessionId(e){return e.sessionId?.value||e.internalId||ccPatchTit
 var ccPatchBusyBySession=new Map,ccPatchDoneSessions=new Set;
 function ccPatchTrackSessionStatus(e,t){let n=ccPatchSessionId(e),r=!!e.busy?.value,a=ccPatchBusyBySession.get(n);a===void 0?ccPatchBusyBySession.set(n,r):(a&&!r&&(ccPatchDoneSessions.add(n),setTimeout(t,0)),ccPatchBusyBySession.set(n,r))}
 function ccPatchClearDone(e){ccPatchDoneSessions.delete(ccPatchSessionId(e))}
-function ccPatchSessionIndicator(e){return e.busy?.value?`running`:ccPatchDoneSessions.has(ccPatchSessionId(e))?`done`:``}
+function ccPatchIsWaiting(e){let t=e.messages?.value;if(!t||!t.length)return!1;let n=t[t.length-1];return n?.type===`assistant`}
+function ccPatchSessionIndicator(e){if(e.busy?.value)return`running`;if(ccPatchIsWaiting(e))return`waiting`;if(ccPatchDoneSessions.has(ccPatchSessionId(e)))return`done`;return``}
 function ccPatchCloseMenu(){document.querySelector(`.claudePatchContextMenu`)?.remove()}
 function ccPatchShowMenu(e,t,n,r){ccPatchCloseMenu();let a=document.createElement(`div`);a.className=`claudePatchContextMenu`,a.style.left=`${Math.min(e,window.innerWidth-150)}px`,a.style.top=`${Math.min(t,window.innerHeight-72)}px`;let i=(s,o)=>{let c=document.createElement(`button`),l=!1,d=(u)=>{u.preventDefault(),u.stopPropagation();if(l)return;l=!0,ccPatchCloseMenu(),o()};return c.textContent=s,c.onmousedown=d,c.onclick=d,a.appendChild(c),c};i(`Pin`,n),i(`Star`,r),document.body.appendChild(a);setTimeout(()=>document.addEventListener(`mousedown`,ccPatchCloseMenu,{once:!0}),0)}
 function ccPatchStartResize(e){e.preventDefault();let t=e.currentTarget.parentElement?.querySelector(`.claudePatchInlineSessions`);if(!t||document.body.classList.contains(`claudePatchSessionsHidden`))return;let n=e.clientX,r=t.getBoundingClientRect().width,a=(i)=>{let s=Math.max(180,Math.min(window.innerWidth*.75,r-(i.clientX-n)));document.documentElement.style.setProperty(`--claude-patch-sessions-width`,`${s}px`);try{localStorage.setItem(`claudePatchSessionsWidth`,String(s))}catch(o){}},o=()=>{document.removeEventListener(`pointermove`,a),document.removeEventListener(`pointerup`,o)};document.addEventListener(`pointermove`,a),document.addEventListener(`pointerup`,o)}
@@ -93,7 +102,7 @@ def patch_webview_js(webview_js: Path) -> bool:
     anchor = "var _R0=16,wR0=1000;"
     if anchor not in text:
         raise RuntimeError("Could not find Claude session-list helper anchor")
-    if "function ccPatchToggleSessions(" not in text:
+    if "function ccPatchIsWaiting(" not in text:
         # Upgrade path: an older helper block may already be present. Strip it
         # back to the anchor, then re-inject the current helper block.
         helper_start = text.find("function ccPatchTitle(")
@@ -130,9 +139,15 @@ def patch_webview_js(webview_js: Path) -> bool:
         changed = True
 
     old_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'
-    new_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),R1&&S0.default.createElement("span",{className:`claudePatchStatus ${R1==="running"?"claudePatchStatusRunning":"claudePatchStatusDone"}`,title:R1==="running"?"Running":"Completed"}),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'
+    new_status_insert = 'S0.default.createElement("span",{className:w2.sessionName},Le1(Kk(Z),Q)),R1&&S0.default.createElement("span",{className:`claudePatchStatus claudePatchStatus${R1.charAt(0).toUpperCase()}${R1.slice(1)}`,title:R1==="running"?"Running":R1==="waiting"?"Waiting for your reply":"Completed"}),B&&Z.worktree.value&&Z.worktree.value.path!==W&&'
     if old_status_insert in text:
         text = text.replace(old_status_insert, new_status_insert, 1)
+        changed = True
+    # Upgrade path: replace the legacy 2-state status span with the 3-state one.
+    legacy_status_span = 'R1&&S0.default.createElement("span",{className:`claudePatchStatus ${R1==="running"?"claudePatchStatusRunning":"claudePatchStatusDone"}`,title:R1==="running"?"Running":"Completed"})'
+    new_status_span = 'R1&&S0.default.createElement("span",{className:`claudePatchStatus claudePatchStatus${R1.charAt(0).toUpperCase()}${R1.slice(1)}`,title:R1==="running"?"Running":R1==="waiting"?"Waiting for your reply":"Completed"})'
+    if legacy_status_span in text:
+        text = text.replace(legacy_status_span, new_status_span, 1)
         changed = True
 
     old_inline = 'p0.default.createElement("div",{className:h6.body},p0.default.createElement("div",{className:h6.content},'
@@ -159,11 +174,15 @@ def patch_webview_js(webview_js: Path) -> bool:
     return changed
 
 
+CSS_SENTINEL_START = "/*claudePatch:start*/"
+CSS_SENTINEL_END = "/*claudePatch:end*/"
+
+
 def patch_webview_css(webview_css: Path) -> bool:
     text = read(webview_css)
     changed = False
-    old = ".dropdown_Wc_2Bg{position:fixed;background:var(--app-menu-background);border:1px solid var(--app-menu-border);display:flex;z-index:1000;outline:none;box-sizing:border-box;border-radius:12px;flex-direction:column;width:min(400px,100vw - 32px);max-height:min(500px,50vh);padding:6px;box-shadow:0 4px 16px #0000001a}"
-    new = old + (
+    anchor = ".dropdown_Wc_2Bg{position:fixed;background:var(--app-menu-background);border:1px solid var(--app-menu-border);display:flex;z-index:1000;outline:none;box-sizing:border-box;border-radius:12px;flex-direction:column;width:min(400px,100vw - 32px);max-height:min(500px,50vh);padding:6px;box-shadow:0 4px 16px #0000001a}"
+    patch_body = (
         ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}"
         ".overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}"
         ".claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}"
@@ -177,25 +196,42 @@ def patch_webview_css(webview_css: Path) -> bool:
         "body.claudePatchSessionsHidden .claudePatchSidebarIcon::after{background:transparent}"
         ".claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}"
         ".claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}"
+        ".claudePatchStatusWaiting{background:var(--vscode-charts-yellow,#f59e0b);box-shadow:0 0 0 0 var(--vscode-charts-yellow,#f59e0b);animation:claudePatchWaitingPulse 1.6s ease-in-out infinite}"
         ".claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}"
         "@keyframes claudePatchSpin{to{transform:rotate(360deg)}}"
+        "@keyframes claudePatchWaitingPulse{0%,100%{opacity:1;box-shadow:0 0 0 0 color-mix(in srgb,var(--vscode-charts-yellow,#f59e0b)55%,transparent)}50%{opacity:.85;box-shadow:0 0 0 4px color-mix(in srgb,var(--vscode-charts-yellow,#f59e0b)0%,transparent)}}"
         ".claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}"
         ".claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}"
         ".claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}"
     )
-    # Replace pre-existing patched CSS block in-place if already applied.
-    legacy_new = old + ".claudePatchMainContent{position:relative;z-index:2;overflow:visible}.overlay_f3sAzg{z-index:10000;background-color:#000000e6}.claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}.claudePatchInlineSessions>div{height:100%}.claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}.claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}.claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}.claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}.claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}@keyframes claudePatchSpin{to{transform:rotate(360deg)}}.claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}.claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}.claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}"
-    if legacy_new in text:
-        text = text.replace(legacy_new, new, 1)
+    new_block = CSS_SENTINEL_START + patch_body + CSS_SENTINEL_END
+    # Strip any prior patched block so reapplying always lands the current CSS.
+    start = text.find(CSS_SENTINEL_START)
+    end = text.find(CSS_SENTINEL_END)
+    if start != -1 and end != -1 and end > start:
+        text = text[:start] + text[end + len(CSS_SENTINEL_END):]
         changed = True
-    elif new in text:
-        pass  # already current
-    elif old in text:
-        text = text.replace(old, new, 1)
+    # Also strip the v0.0.x / v0.1.x raw-appended blocks (no sentinels).
+    for legacy in _LEGACY_CSS_BLOCKS:
+        if legacy in text:
+            text = text.replace(legacy, "", 1)
+            changed = True
+    if anchor not in text:
+        raise RuntimeError("Could not find Claude CSS anchor")
+    if new_block not in text:
+        text = text.replace(anchor, anchor + new_block, 1)
         changed = True
     if changed:
         write(webview_css, text)
     return changed
+
+
+_LEGACY_CSS_BLOCKS = (
+    # v0.0.x — original spec, before toggle support
+    ".claudePatchMainContent{position:relative;z-index:2;overflow:visible}.overlay_f3sAzg{z-index:10000;background-color:#000000e6}.claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}.claudePatchInlineSessions>div{height:100%}.claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}.claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}.claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}.claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}.claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}@keyframes claudePatchSpin{to{transform:rotate(360deg)}}.claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}.claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}.claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}",
+    # v0.1.x — added toggle, min-width/min-height, extra overlay classes, but no waiting indicator
+    ".claudePatchMainContent{position:relative;z-index:2;min-width:0;min-height:0;overflow:hidden}.overlay_f3sAzg,.overlay_W2z5EA,.overlay_yumWmQ,.overlay_5FHdxw,.overlay_ukWSlw{z-index:10000;background-color:#000000e6}.claudePatchInlineSessions{order:2;position:relative;z-index:0;flex:0 0 var(--claude-patch-sessions-width,min(44vw,360px));min-width:180px;max-width:75%;border-left:1px solid var(--app-primary-border-color);overflow:hidden;background:var(--app-primary-background)}.claudePatchInlineSessions>div{height:100%}.claudePatchResizeHandle{order:1;position:relative;z-index:0;flex:0 0 4px;cursor:col-resize;background:var(--app-primary-border-color);opacity:.5}.claudePatchResizeHandle:hover,.claudePatchResizeHandle:active{opacity:1;background:var(--vscode-sash-hoverBorder,var(--app-primary-border-color))}body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}.claudePatchSidebarIcon{display:inline-block;width:14px;height:14px;border:1.5px solid currentColor;border-radius:2px;box-sizing:border-box;position:relative;opacity:.9}.claudePatchSidebarIcon::after{content:'';position:absolute;top:0;bottom:0;right:0;width:5px;background:currentColor;border-radius:0 .5px .5px 0}body.claudePatchSessionsHidden .claudePatchSidebarIcon{opacity:.55}body.claudePatchSessionsHidden .claudePatchSidebarIcon::after{background:transparent}.claudePatchStatus{flex:0 0 auto;width:8px;height:8px;border-radius:50%;margin-left:2px}.claudePatchStatusDone{background:var(--vscode-charts-blue,#3b82f6)}.claudePatchStatusRunning{box-sizing:border-box;width:10px;height:10px;background:transparent;border:2px solid var(--app-secondary-foreground);border-top-color:transparent;animation:claudePatchSpin .8s linear infinite}@keyframes claudePatchSpin{to{transform:rotate(360deg)}}.claudePatchContextMenu{position:fixed;z-index:2000;background:var(--app-menu-background);border:1px solid var(--app-menu-border);border-radius:6px;padding:4px;box-shadow:0 4px 16px #00000040;display:flex;flex-direction:column;min-width:120px}.claudePatchContextMenu button{background:transparent;border:0;color:var(--app-primary-foreground);text-align:left;padding:6px 10px;border-radius:4px;cursor:pointer}.claudePatchContextMenu button:hover{background:var(--app-list-hover-background)}",
+)
 
 
 def patch_extension_dir(extension_dir: Path) -> bool:
@@ -227,6 +263,7 @@ def verify_extension_dir(extension_dir: Path) -> None:
         "sessions hidden state": "body.claudePatchSessionsHidden .claudePatchInlineSessions,body.claudePatchSessionsHidden .claudePatchResizeHandle{display:none!important}" in css,
         "resize handle": "ccPatchStartResize" in js and ".claudePatchResizeHandle{order:1;position:relative;z-index:0;" in css,
         "status indicators": "ccPatchSessionIndicator" in js and ".claudePatchStatusRunning" in css and ".claudePatchStatusDone" in css,
+        "waiting indicator": "ccPatchIsWaiting" in js and ".claudePatchStatusWaiting" in css and "@keyframes claudePatchWaitingPulse" in css,
         "rewind without file changes": "W=q?.canRewind&&!Q;" in js,
         "edit actions preserved": 'title:"Rename session"' in js and 'title:"Delete session"' in js,
     }
@@ -257,11 +294,12 @@ def main() -> int:
     parser.add_argument("--version", default="")
     parser.add_argument("--download-dir", default=".")
     parser.add_argument("--log", default="claude-vsix-patch.log")
+    parser.add_argument("-V", "--patcher-version", action="version", version=f"vscode-claude-code-extension-improvements-patch {__version__}")
     args = parser.parse_args()
 
     LOG_PATH = Path(args.log).expanduser().resolve()
     LOG_PATH.write_text("", encoding="utf-8")
-    log("Starting Claude VSIX patcher")
+    log(f"Starting Claude VSIX patcher v{__version__}")
     raw = args.target
     raw_path = Path(raw).expanduser()
     if raw_path.exists() or raw_path.suffix.lower() == ".vsix":

@@ -1,6 +1,8 @@
-# vsclaudefix
+# VSCode Claude Code Extension Improvement's Patch
 
-A post-build patcher for the **Claude Code VS Code extension** that replaces the cramped session-history popover with a persistent, resizable session pane — plus a handful of related ergonomic fixes.
+> Current version: **v0.2.0**
+
+A post-build patcher for the **Claude Code VS Code extension** that replaces the cramped session-history popover with a persistent, resizable session pane — plus a handful of related ergonomic fixes and status indicators.
 
 This is a community patch, not an official Anthropic project. It edits the installed extension's bundled `webview/index.js` and `webview/index.css` in place (or a downloaded `.vsix`).
 
@@ -9,12 +11,26 @@ This is a community patch, not an official Anthropic project. It edits the insta
 - **Persistent right-side session pane** with a draggable divider between chat and sessions.
 - **Header toggle button** (next to "Session history") that hides/shows the session pane. State and the chosen width persist across reloads.
 - **Pin / Star** actions on sessions via right-click context menu. Pinned sessions sort to the top.
-- **Running spinner** on busy sessions, **blue "done" dot** on sessions that just finished. Clicking a finished session clears the dot.
+- **Three status indicators on session rows:**
+  - **Running** — animated spinner while the session is actively working.
+  - **Waiting for your reply** *(new in v0.2.0)* — pulsing amber dot when the session is idle and Claude's last message is waiting on you (e.g. it asked a question or finished a turn).
+  - **Done** — solid blue dot when a session just finished. Cleared when you click the session.
 - **Rewind without file changes** — the "Rewind code" dialog no longer disables its primary action when the dry-run reports zero file diffs, so context rewinds still work.
 - **Modal layering hardened** — all five of the bundle's modal overlay classes are bumped above the split-pane UI so dialogs are not covered by the divider or the session list.
 - **Flex layout hardened** — chat and session panes get `min-width: 0 / min-height: 0` and the chat pane gets its own stacking context, so long messages or wide code blocks no longer push the divider or clip the session pane.
 
 Existing rename/edit and delete actions are preserved exactly as they are in the stock extension.
+
+### Status indicator priority
+
+When more than one condition is true, the indicator picks the most-actionable state:
+
+1. `running` — session is busy
+2. `waiting` — session is idle and the last message was from Claude
+3. `done` — session just transitioned from busy to idle (cleared on click)
+4. *(no indicator)*
+
+> Note: `waiting` is inferred — Claude Code doesn't expose a real "awaiting input" signal in the bundle, so this lights up whenever the last message is from Claude. That covers "Claude asked a question / is waiting on you to type", but it can false-positive on sessions Claude simply finished without a question. Treat it as a hint, not ground truth.
 
 ## Requirements
 
@@ -39,6 +55,9 @@ python patch_claude_vsix_tasks.py ./anthropic.claude-code-2.1.147.vsix
 
 # Custom output path
 python patch_claude_vsix_tasks.py --out ./claude-code.patched.vsix
+
+# Print patcher version
+python patch_claude_vsix_tasks.py --patcher-version
 ```
 
 Then install the resulting `*.tasks-patched.vsix` via **Extensions → "..." menu → Install from VSIX...**.
@@ -62,6 +81,10 @@ print('CHANGED:', m.patch_extension_dir(pathlib.Path('<path to anthropic.claude-
 
 Reload the VS Code window (**Ctrl/Cmd+Shift+P → Developer: Reload Window**) to pick up the new bundle.
 
+## Upgrading from an earlier patcher version
+
+The patcher detects whichever prior version's helper block is present and replaces it cleanly. Just re-run the script against the same target — no need to uninstall or revert first. The CSS block is wrapped in `/*claudePatch:start*/` / `/*claudePatch:end*/` sentinels so reapplication is idempotent.
+
 ## Rollback
 
 If anything looks broken:
@@ -75,7 +98,7 @@ The patch script anchors on specific minified identifiers in the Claude Code bun
 
 Tested against:
 
-- `anthropic.claude-code-2.1.147`
+- Claude Code extension `2.1.147`
 
 If the patch fails on a newer version, please open an issue with the extension version and the failing anchor.
 
@@ -84,6 +107,22 @@ If the patch fails on a newer version, please open an issue with the extension v
 Claude Code's source is not public. The webview bundle is the only artifact available to modify. The patch is intentionally narrow — it injects a small helper block, swaps a handful of minified call sites, and adds a single CSS block. The goal is for Anthropic to eventually implement these ergonomics natively; until then this fills the gap.
 
 See [CLAUDE_EXTENSION_FEEDBACK.md](CLAUDE_EXTENSION_FEEDBACK.md) for the full feature spec sent to the Anthropic team.
+
+## Changelog
+
+### v0.2.0
+
+- Added **waiting** status indicator (pulsing amber dot) for sessions where Claude's last message is awaiting your reply.
+- Added header toggle button that hides/shows the session pane, with persisted state + width.
+- Hardened split-pane flex layout (`min-width: 0` / `min-height: 0`) so long messages no longer push the divider.
+- Bumped z-index on all five modal overlay classes so dialogs sit above the session pane and resize divider.
+- Wrapped injected CSS in sentinel comments for clean idempotent re-application.
+- Added `--patcher-version` CLI flag.
+- Renamed project to *VSCode Claude Code Extension Improvement's Patch*.
+
+### v0.1.0
+
+- Initial public release: persistent right-side session pane, draggable divider, pin/star context menu, running spinner, done dot, rewind-without-file-changes fix.
 
 ## License
 
