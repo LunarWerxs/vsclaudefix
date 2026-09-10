@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **Retired.** This patcher is superseded by [Claude Code Orbit](https://github.com/Lunarwerx/claude-code-orbit), the same idea rebuilt as a patch companion that updates itself. The releases here keep working but will not be updated, and this repository is archived.
+
 # vsclaudefix
 
 **Make the Claude Code sidebar pull its weight.**
